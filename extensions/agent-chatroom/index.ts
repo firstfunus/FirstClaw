@@ -99,7 +99,82 @@ interface TaskRecord {
   error_detail?: string | null;
   progress_log?: ProgressEntry[];
   current_phase?: string | null;
+  plan_id?: string | null;
+  current_step?: number | null;
+  total_steps?: number | null;
 }
+
+// ── Plan Mode types ──────────────────────────────────────────────────────────
+
+type PlanStatus =
+  | "DRAFT"
+  | "PENDING_REVIEW"
+  | "APPROVED"
+  | "EXECUTING"
+  | "COMPLETED"
+  | "FAILED"
+  | "CANCELLED";
+
+type PlanStepStatus = "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED" | "SKIPPED";
+
+interface StepComment {
+  comment_id: string;
+  step_id: string;
+  from: string;
+  text: string;
+  timestamp: string;
+  type: "suggestion" | "approval" | "warning" | "rejection";
+}
+
+interface PlanStep {
+  step_id: string;
+  order: number;
+  title: string;
+  description: string;
+  status: PlanStepStatus;
+  estimated_minutes: number;
+  timeout_minutes: number;
+  result_summary: string | null;
+  output_files: string[];
+  started_at: string | null;
+  completed_at: string | null;
+  error_detail: string | null;
+  comments: StepComment[];
+}
+
+interface PlanApproval {
+  mode: "orchestrator" | "human";
+  approved_by: string | null;
+  decision: "pending" | "approved" | "rejected" | "revision_requested" | null;
+  decision_reason: string | null;
+  decided_at: string | null;
+}
+
+interface TaskPlan {
+  plan_id: string;
+  task_id: string;
+  agent_id: string;
+  status: PlanStatus;
+  summary: string;
+  estimated_total_minutes: number;
+  steps: PlanStep[];
+  approval: PlanApproval;
+  created_at: string;
+  approved_at: string | null;
+  completed_at: string | null;
+  revision: number;
+}
+
+interface StepResult {
+  success: boolean;
+  result_summary: string;
+  output_files: string[];
+  error_detail?: string;
+}
+
+const PLANNING_TIMEOUT_MS = 3 * 60_000;
+const DEFAULT_STEP_TIMEOUT_MS = 10 * 60_000;
+const MAX_STEP_TIMEOUT_MS = 30 * 60_000;
 
 type ParkWatchType = "shell" | "file" | "poll_url" | "permission";
 
@@ -240,6 +315,120 @@ function chatroomRoot(cfg: ChatroomConfig): string {
 
 function tasksDir(cfg: ChatroomConfig): string {
   return path.join(chatroomRoot(cfg), "tasks");
+}
+
+function plansDir(cfg: ChatroomConfig): string {
+  return path.join(chatroomRoot(cfg), "plans");
+}
+
+function configDir(cfg: ChatroomConfig): string {
+  return path.join(chatroomRoot(cfg), "config");
+}
+
+// ── Plan NAS helpers ─────────────────────────────────────────────────────────
+
+function readPlan(cfg: ChatroomConfig, taskId: string): TaskPlan | null {
+  return readJson(path.join(plansDir(cfg), `${taskId}.json`));
+}
+
+function writePlan(cfg: ChatroomConfig, plan: TaskPlan): void {
+  const dir = plansDir(cfg);
+  ensureDir(dir);
+  writeJson(path.join(dir, `${plan.task_id}.json`), plan);
+}
+
+function updatePlan(
+  cfg: ChatroomConfig,
+  taskId: string,
+  patch: Partial<TaskPlan>,
+): TaskPlan | null {
+  const plan = readPlan(cfg, taskId);
+  if (!plan) return null;
+  const updated = { ...plan, ...patch };
+  writePlan(cfg, updated);
+  return updated;
+}
+
+function updatePlanStep(
+  cfg: ChatroomConfig,
+  taskId: string,
+  stepId: string,
+  patch: Partial<PlanStep>,
+): TaskPlan | null {
+  const plan = readPlan(cfg, taskId);
+  if (!plan) return null;
+  plan.steps = plan.steps.map((s) => (s.step_id === stepId ? { ...s, ...patch } : s));
+  writePlan(cfg, plan);
+  return plan;
+}
+
+function createNewPlan(
+  cfg: ChatroomConfig,
+  taskId: string,
+  agentId: string,
+  summary: string,
+  steps: Omit<
+    PlanStep,
+    | "step_id"
+    | "status"
+    | "result_summary"
+    | "output_files"
+    | "started_at"
+    | "completed_at"
+    | "error_detail"
+    | "comments"
+  >[],
+  approvalMode: "orchestrator" | "human",
+): TaskPlan {
+  const plan: TaskPlan = {
+    plan_id: randomUUID(),
+    task_id: taskId,
+    agent_id: agentId,
+    status: "DRAFT",
+    summary,
+    estimated_total_minutes: steps.reduce((sum, s) => sum + s.estimated_minutes, 0),
+    steps: steps.map((s, i) => ({
+      step_id: randomUUID(),
+      order: s.order ?? i + 1,
+      title: s.title,
+      description: s.description,
+      status: "PENDING" as PlanStepStatus,
+      estimated_minutes: s.estimated_minutes,
+      timeout_minutes: Math.min(
+        s.timeout_minutes ?? DEFAULT_STEP_TIMEOUT_MS / 60_000,
+        MAX_STEP_TIMEOUT_MS / 60_000,
+      ),
+      result_summary: null,
+      output_files: [],
+      started_at: null,
+      completed_at: null,
+      error_detail: null,
+      comments: [],
+    })),
+    approval: {
+      mode: approvalMode,
+      approved_by: null,
+      decision: "pending",
+      decision_reason: null,
+      decided_at: null,
+    },
+    created_at: nowISO(),
+    approved_at: null,
+    completed_at: null,
+    revision: 1,
+  };
+  writePlan(cfg, plan);
+  return plan;
+}
+
+function readGlobalSettings(cfg: ChatroomConfig): Record<string, any> {
+  const settingsPath = path.join(configDir(cfg), "settings.json");
+  return readJson(settingsPath) ?? { allow_orchestrator_decisions: true };
+}
+
+function getApprovalMode(cfg: ChatroomConfig): "orchestrator" | "human" {
+  const settings = readGlobalSettings(cfg);
+  return settings.allow_orchestrator_decisions ? "orchestrator" : "human";
 }
 
 function assetsDir(cfg: ChatroomConfig, agentId?: string): string {
@@ -1816,7 +2005,55 @@ function handleIncomingTask(
   setAgentWorking(cfg, cfg.agentId, taskId, logger);
   logger.info(`Processing task ${taskId} from ${msg.from}: "${msg.content.text.slice(0, 80)}..."`);
 
-  autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
+  const isLongRunning = Boolean(msg.metadata?.long_running);
+  const usePlanMode = shouldUsePlanMode(msg.content.text, isLongRunning);
+
+  if (usePlanMode) {
+    logger.info(`Task ${taskId}: using Plan Mode (long_running=${isLongRunning})`);
+    handlePlanModeTask(cfg, msg, taskId, runtime, config, logger);
+  } else {
+    logger.info(`Task ${taskId}: using direct execution (simple task)`);
+    autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
+  }
+}
+
+/**
+ * Plan Mode: planning phase -> approval -> step-by-step execution.
+ */
+async function handlePlanModeTask(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  taskId: string,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<void> {
+  try {
+    // Phase 1: Planning
+    const plan = await planningPhase(cfg, msg, taskId, runtime, config, logger);
+    if (!plan) {
+      logger.warn(`Plan mode failed for task ${taskId} — falling back to direct execution`);
+      autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
+      return;
+    }
+
+    // Phase 1.5: Approval
+    const approvedPlan = await waitForApproval(cfg, plan, taskId, logger);
+    if (!approvedPlan) {
+      logger.info(`Plan for task ${taskId} was not approved`);
+      const existingTask = readTaskRecord(cfg, taskId);
+      if (existingTask && existingTask.status !== "CANCELLED" && existingTask.status !== "FAILED") {
+        sendTaskResult(cfg, taskId, "Plan was rejected or approval timed out", "FAILED", logger);
+      }
+      return;
+    }
+
+    // Phase 2: Step-by-step execution
+    await stepExecutionLoop(cfg, approvedPlan, msg, taskId, runtime, config, logger);
+  } catch (err) {
+    logger.error(`Plan mode error for task ${taskId}: ${err}`);
+    sendTaskResult(cfg, taskId, `Plan mode failed: ${err}`, "FAILED", logger);
+  }
 }
 
 function handleTaskAck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
@@ -2109,6 +2346,12 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   lines.push(`  These perform direct binary copy with MD5 verification — no base64 needed.`);
   lines.push(``);
 
+  lines.push(`═══ Plan Mode ═══`);
+  lines.push(`  Agents create execution plans before starting complex tasks.`);
+  lines.push(`  Use chatroom_approve_plan to approve, reject, or request revision of plans.`);
+  lines.push(`  Use chatroom_list_plans to see all plans.`);
+  lines.push(``);
+
   const activeTasks = listTasksByStatus(
     cfg,
     "DISPATCHED",
@@ -2124,11 +2367,51 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
       const errInfo = t.error_type ? ` [ERROR: ${t.error_type}]` : "";
       const permNote =
         t.current_phase === "awaiting_permission" ? " ⏳ AWAITING ADMIN APPROVAL" : "";
+      const planNote = t.current_phase?.includes("awaiting_plan") ? " 📋 PLAN AWAITING REVIEW" : "";
+      const stepInfo =
+        t.current_step != null && t.total_steps != null
+          ? ` [Step ${t.current_step}/${t.total_steps}]`
+          : "";
       lines.push(
-        `  - [${t.status}${phase}${errInfo}${permNote}] ${t.task_id.slice(0, 8)}... → ${t.to}: "${t.instruction.slice(0, 60)}"`,
+        `  - [${t.status}${phase}${stepInfo}${errInfo}${permNote}${planNote}] ${t.task_id.slice(0, 8)}... → ${t.to}: "${t.instruction.slice(0, 60)}"`,
       );
     }
     lines.push(``);
+  }
+
+  // Show pending plans that need orchestrator review
+  try {
+    const plDir = plansDir(cfg);
+    if (fs.existsSync(plDir)) {
+      const pendingPlans: TaskPlan[] = [];
+      for (const f of fs.readdirSync(plDir)) {
+        if (!f.endsWith(".json")) continue;
+        const plan = readJson(path.join(plDir, f)) as TaskPlan | null;
+        if (
+          plan &&
+          (plan.status === "PENDING_REVIEW" || plan.status === "DRAFT") &&
+          plan.approval?.decision === "pending"
+        ) {
+          pendingPlans.push(plan);
+        }
+      }
+      if (pendingPlans.length > 0) {
+        lines.push(`═══ Plans Awaiting Review ═══`);
+        for (const p of pendingPlans) {
+          lines.push(`  - Task ${p.task_id.slice(0, 8)}... by ${p.agent_id}: "${p.summary}"`);
+          lines.push(`    Steps: ${p.steps.length} (est. ${p.estimated_total_minutes}min)`);
+          for (const s of p.steps) {
+            lines.push(`      ${s.order}. ${s.title} (~${s.estimated_minutes}min)`);
+          }
+          lines.push(
+            `    → Use chatroom_approve_plan(task_id="${p.task_id}", decision="approved") to approve`,
+          );
+        }
+        lines.push(``);
+      }
+    }
+  } catch {
+    /* ignore errors reading plans dir */
   }
 
   return lines.join("\n");
@@ -2282,9 +2565,549 @@ async function autoDispatchMessage(
   });
 }
 
+// ============================================================================
+// Plan Mode — two-phase execution: planning + step-by-step
+// ============================================================================
+
+function shouldUsePlanMode(instruction: string, isLongRunning: boolean): boolean {
+  if (isLongRunning) return true;
+  const wordCount = instruction.split(/\s+/).length;
+  return wordCount > 30;
+}
+
+/**
+ * Phase 1: Short LLM call to produce a structured plan.
+ * Returns the created plan, or null if planning was skipped/failed.
+ */
+async function planningPhase(
+  chatroomCfg: ChatroomConfig,
+  msg: InboxMessage,
+  taskId: string,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<TaskPlan | null> {
+  const channelId = msg.channel_id;
+  const isDM = channelId.startsWith("dm_");
+
+  const route = runtime.channel.routing.resolveAgentRoute({
+    cfg: config,
+    channel: "chatroom",
+    peer: { kind: isDM ? "direct" : "group", id: channelId },
+  });
+
+  const planningPrompt = [
+    `[CHATROOM TASK — PLANNING PHASE]`,
+    `task_id: ${taskId}`,
+    `assigned_by: ${msg.from}`,
+    ``,
+    `INSTRUCTION:`,
+    msg.content.text,
+    ``,
+    `You are in PLANNING MODE. Do NOT execute the task yet.`,
+    `Analyze the instruction and create a structured execution plan.`,
+    ``,
+    `Call chatroom_create_plan with:`,
+    `  - task_id: "${taskId}"`,
+    `  - summary: a one-line summary of the plan`,
+    `  - steps: an ordered array of steps, each with:`,
+    `    - title: short label`,
+    `    - description: detailed instructions for this step`,
+    `    - estimated_minutes: how long you think it will take`,
+    `    - timeout_minutes: max allowed time (default 10, max 30)`,
+    ``,
+    `Guidelines:`,
+    `  - Break the task into 2-8 logical, self-contained steps`,
+    `  - Each step should produce a verifiable outcome`,
+    `  - Steps for builds/uploads/deployments should have higher timeout_minutes`,
+    `  - Keep descriptions specific and actionable`,
+    `  - After calling chatroom_create_plan, respond with a brief confirmation`,
+  ].join("\n");
+
+  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+    Body: planningPrompt,
+    BodyForAgent: planningPrompt,
+    RawBody: msg.content.text,
+    CommandBody: msg.content.text,
+    From: `chatroom:${msg.from}`,
+    To: `chatroom:${chatroomCfg.agentId}`,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: isDM ? "direct" : "group",
+    SenderName: msg.from,
+    SenderId: msg.from,
+    Provider: "chatroom",
+    Surface: "chatroom",
+    MessageSid: `${msg.message_id}-plan`,
+    Timestamp: Date.now(),
+    CommandAuthorized: true,
+  });
+
+  const prefixContext = createReplyPrefixContext({
+    cfg: config,
+    agentId: route.agentId,
+  });
+
+  let planCreated = false;
+
+  appendTaskProgress(chatroomCfg, taskId, { phase: "planning", detail: "Creating execution plan" });
+
+  const dispatcherOptions = {
+    responsePrefix: prefixContext.responsePrefix,
+    responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
+    deliver: async (payload: ReplyPayload, info?: { kind: string }) => {
+      const kind = info?.kind ?? "final";
+      if (kind === "tool") {
+        appendTaskProgress(chatroomCfg, taskId, {
+          phase: "planning_tool",
+          detail: (payload.text ?? "").slice(0, 200),
+        });
+      }
+      if (kind === "final") {
+        planCreated = true;
+      }
+    },
+    onError: (err: any) => {
+      logger.error(`Planning phase error for task ${taskId}: ${err}`);
+    },
+  };
+
+  logger.info(
+    `Starting planning phase for task ${taskId} (timeout: ${PLANNING_TIMEOUT_MS / 1000}s)`,
+  );
+
+  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg: config,
+    dispatcherOptions,
+    replyOptions: {
+      onModelSelected: prefixContext.onModelSelected,
+      toolsDeny: ["message", "feishu_*", "lark_*"],
+      agentTimeoutMs: PLANNING_TIMEOUT_MS,
+    },
+  });
+
+  const plan = readPlan(chatroomCfg, taskId);
+  if (!plan) {
+    logger.warn(`Planning phase completed but no plan was created for task ${taskId}`);
+  }
+  return plan;
+}
+
+/**
+ * Wait for plan approval. In orchestrator mode, sends a review request
+ * to the orchestrator. In human mode, waits for dashboard approval.
+ * Returns the approved plan, or null if rejected/timed out.
+ */
+async function waitForApproval(
+  cfg: ChatroomConfig,
+  plan: TaskPlan,
+  taskId: string,
+  logger: Logger,
+): Promise<TaskPlan | null> {
+  if (plan.approval.mode === "orchestrator") {
+    // Notify orchestrator about the plan
+    sendMessageToNAS(
+      cfg,
+      "general",
+      `[PLAN_REVIEW_REQUEST] Agent ${plan.agent_id} created a plan for task ${taskId}:\n` +
+        `Summary: ${plan.summary}\n` +
+        `Steps: ${plan.steps.length} (est. ${plan.estimated_total_minutes}min)\n` +
+        plan.steps.map((s) => `  ${s.order}. ${s.title} (~${s.estimated_minutes}min)`).join("\n") +
+        `\n\nUse chatroom_approve_plan to approve, reject, or request revision.`,
+      "SYSTEM",
+      ["firstclaw"],
+      undefined,
+      { task_id: taskId, plan_id: plan.plan_id },
+    );
+
+    updatePlan(cfg, taskId, { status: "PENDING_REVIEW" });
+    updateTaskRecord(cfg, taskId, { current_phase: "awaiting_plan_review" } as Partial<TaskRecord>);
+    logger.info(`Plan for task ${taskId} sent to orchestrator for review`);
+
+    // Poll for approval with a timeout (5 min for orchestrator mode)
+    const approvalTimeoutMs = 5 * 60_000;
+    const pollMs = 3_000;
+    const deadline = Date.now() + approvalTimeoutMs;
+
+    while (Date.now() < deadline) {
+      const current = readPlan(cfg, taskId);
+      if (!current) return null;
+
+      if (current.status === "APPROVED") {
+        logger.info(`Plan for task ${taskId} approved by ${current.approval.approved_by}`);
+        return current;
+      }
+      if (current.status === "CANCELLED") {
+        logger.info(`Plan for task ${taskId} rejected`);
+        return null;
+      }
+      if (current.status === "DRAFT" && current.revision > plan.revision) {
+        logger.info(`Plan for task ${taskId} revision requested — would need re-planning`);
+        return null;
+      }
+
+      // Check if the task was cancelled externally
+      const task = readTaskRecord(cfg, taskId);
+      if (task?.status === "CANCELLED") {
+        updatePlan(cfg, taskId, { status: "CANCELLED", completed_at: nowISO() });
+        return null;
+      }
+
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+
+    // Auto-approve on timeout in orchestrator mode
+    logger.info(`Plan approval timed out for task ${taskId}, auto-approving`);
+    const approved = updatePlan(cfg, taskId, {
+      status: "APPROVED",
+      approved_at: nowISO(),
+      approval: {
+        ...plan.approval,
+        approved_by: "system:auto",
+        decision: "approved",
+        decision_reason: "Auto-approved after timeout",
+        decided_at: nowISO(),
+      },
+    });
+    return approved;
+  }
+
+  // Human mode: wait for dashboard approval (no auto-approve timeout)
+  updatePlan(cfg, taskId, { status: "PENDING_REVIEW" });
+  updateTaskRecord(cfg, taskId, {
+    current_phase: "awaiting_human_approval",
+  } as Partial<TaskRecord>);
+  logger.info(`Plan for task ${taskId} awaiting human approval`);
+
+  const humanPollMs = 5_000;
+  const humanDeadlineMs = 60 * 60_000; // 1 hour max wait
+  const humanDeadline = Date.now() + humanDeadlineMs;
+
+  while (Date.now() < humanDeadline) {
+    const current = readPlan(cfg, taskId);
+    if (!current) return null;
+    if (current.status === "APPROVED") return current;
+    if (current.status === "CANCELLED") return null;
+
+    const task = readTaskRecord(cfg, taskId);
+    if (task?.status === "CANCELLED") {
+      updatePlan(cfg, taskId, { status: "CANCELLED", completed_at: nowISO() });
+      return null;
+    }
+
+    await new Promise((r) => setTimeout(r, humanPollMs));
+  }
+
+  logger.warn(`Human approval timed out for task ${taskId}`);
+  return null;
+}
+
+/**
+ * Phase 2: Execute each plan step as a separate LLM invocation.
+ */
+async function stepExecutionLoop(
+  chatroomCfg: ChatroomConfig,
+  plan: TaskPlan,
+  msg: InboxMessage,
+  taskId: string,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<void> {
+  updatePlan(chatroomCfg, taskId, { status: "EXECUTING" });
+  updateTaskRecord(chatroomCfg, taskId, {
+    current_phase: "executing_plan",
+    current_step: 0,
+  } as Partial<TaskRecord>);
+
+  const outputDir =
+    msg.metadata?.output_dir ?? taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
+  ensureDir(outputDir as string);
+
+  const previousResults: { title: string; result: string }[] = [];
+
+  for (const step of plan.steps) {
+    // ── Abort checkpoint ──
+    const task = readTaskRecord(chatroomCfg, taskId);
+    if (task?.status === "CANCELLED") {
+      logger.info(`Task ${taskId} cancelled — skipping remaining steps`);
+      const currentPlan = readPlan(chatroomCfg, taskId);
+      if (currentPlan) {
+        for (const s of currentPlan.steps) {
+          if (s.status === "PENDING") {
+            updatePlanStep(chatroomCfg, taskId, s.step_id, { status: "SKIPPED" });
+          }
+        }
+        updatePlan(chatroomCfg, taskId, { status: "CANCELLED", completed_at: nowISO() });
+      }
+      return;
+    }
+
+    // ── Execute step ──
+    logger.info(`Executing step ${step.order}/${plan.steps.length}: ${step.title}`);
+    updatePlanStep(chatroomCfg, taskId, step.step_id, {
+      status: "IN_PROGRESS",
+      started_at: nowISO(),
+    });
+    updateTaskRecord(chatroomCfg, taskId, {
+      current_step: step.order,
+      current_phase: `step_${step.order}/${plan.steps.length}: ${step.title}`,
+    } as Partial<TaskRecord>);
+    appendTaskProgress(chatroomCfg, taskId, {
+      phase: `step_${step.order}_start`,
+      detail: step.title,
+    });
+
+    const result = await executeStep(
+      chatroomCfg,
+      plan,
+      step,
+      taskId,
+      outputDir as string,
+      previousResults,
+      msg,
+      runtime,
+      config,
+      logger,
+    );
+
+    if (result.success) {
+      previousResults.push({ title: step.title, result: result.result_summary });
+    } else {
+      // Step failed — mark remaining as skipped and fail the plan
+      logger.warn(`Step ${step.order} failed: ${result.error_detail}`);
+      updatePlanStep(chatroomCfg, taskId, step.step_id, {
+        status: "FAILED",
+        error_detail: result.error_detail ?? "Unknown error",
+        completed_at: nowISO(),
+      });
+
+      const latestPlan = readPlan(chatroomCfg, taskId);
+      if (latestPlan) {
+        for (const s of latestPlan.steps) {
+          if (s.status === "PENDING") {
+            updatePlanStep(chatroomCfg, taskId, s.step_id, { status: "SKIPPED" });
+          }
+        }
+      }
+      updatePlan(chatroomCfg, taskId, { status: "FAILED", completed_at: nowISO() });
+
+      const allFiles = scanOutputDir(outputDir as string);
+      const errSummary = `Plan failed at step ${step.order}/${plan.steps.length} (${step.title}): ${result.error_detail}`;
+      sendTaskResult(chatroomCfg, taskId, errSummary, "FAILED", logger, allFiles);
+      return;
+    }
+  }
+
+  // All steps completed
+  updatePlan(chatroomCfg, taskId, { status: "COMPLETED", completed_at: nowISO() });
+  const allFiles = scanOutputDir(outputDir as string);
+  const resultSummary = [
+    `Plan completed: ${plan.summary}`,
+    ``,
+    ...previousResults.map((r, i) => `Step ${i + 1} (${r.title}): ${r.result}`),
+  ].join("\n");
+  sendTaskResult(chatroomCfg, taskId, resultSummary, "DONE", logger, allFiles);
+}
+
+/**
+ * Execute a single plan step as an LLM invocation.
+ */
+async function executeStep(
+  chatroomCfg: ChatroomConfig,
+  plan: TaskPlan,
+  step: PlanStep,
+  taskId: string,
+  outputDir: string,
+  previousResults: { title: string; result: string }[],
+  originalMsg: InboxMessage,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<StepResult> {
+  const channelId = originalMsg.channel_id;
+  const isDM = channelId.startsWith("dm_");
+
+  const route = runtime.channel.routing.resolveAgentRoute({
+    cfg: config,
+    channel: "chatroom",
+    peer: { kind: isDM ? "direct" : "group", id: channelId },
+  });
+
+  const commentsContext =
+    step.comments.length > 0
+      ? `\nReviewer comments for this step:\n` +
+        step.comments.map((c) => `  [${c.type}] ${c.from}: ${c.text}`).join("\n")
+      : "";
+
+  const previousContext =
+    previousResults.length > 0
+      ? `\nPrevious step results:\n` +
+        previousResults.map((r, i) => `  Step ${i + 1} (${r.title}): ${r.result}`).join("\n")
+      : "";
+
+  const stepPrompt = [
+    `[CHATROOM TASK — STEP EXECUTION]`,
+    `task_id: ${taskId}`,
+    `step_id: ${step.step_id}`,
+    `plan: ${plan.summary}`,
+    `current_step: ${step.order}/${plan.steps.length}`,
+    `output_dir: ${outputDir}`,
+    ``,
+    `ORIGINAL TASK INSTRUCTION:`,
+    originalMsg.content.text,
+    ``,
+    `CURRENT STEP (${step.order}/${plan.steps.length}): ${step.title}`,
+    `STEP DESCRIPTION:`,
+    step.description,
+    previousContext,
+    commentsContext,
+    ``,
+    `RULES:`,
+    `1. Focus ONLY on this step. Do not work ahead to future steps.`,
+    `2. Use chatroom_publish_file for binary files, chatroom_save_asset for text content.`,
+    `3. When done, call chatroom_complete_step(task_id="${taskId}", step_id="${step.step_id}",`,
+    `   result_summary="...", output_files=[...]) to mark this step complete.`,
+    `4. If you encounter an unrecoverable error, call chatroom_fail_step(task_id="${taskId}",`,
+    `   step_id="${step.step_id}", error_detail="...").`,
+    `5. For long-running operations, use chatroom_task_park.`,
+    `6. SENSITIVE OPERATIONS require chatroom_request_permission.`,
+    `7. DO NOT send messages to other channels or agents.`,
+  ].join("\n");
+
+  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+    Body: stepPrompt,
+    BodyForAgent: stepPrompt,
+    RawBody: step.description,
+    CommandBody: step.description,
+    From: `chatroom:${originalMsg.from}`,
+    To: `chatroom:${chatroomCfg.agentId}`,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: isDM ? "direct" : "group",
+    SenderName: originalMsg.from,
+    SenderId: originalMsg.from,
+    Provider: "chatroom",
+    Surface: "chatroom",
+    MessageSid: `${originalMsg.message_id}-step-${step.order}`,
+    Timestamp: Date.now(),
+    CommandAuthorized: true,
+  });
+
+  const prefixContext = createReplyPrefixContext({
+    cfg: config,
+    agentId: route.agentId,
+  });
+
+  let stepResult: StepResult = {
+    success: false,
+    result_summary: "",
+    output_files: [],
+    error_detail: "Step did not complete",
+  };
+
+  const dispatcherOptions = {
+    responsePrefix: prefixContext.responsePrefix,
+    responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
+    deliver: async (payload: ReplyPayload, info?: { kind: string }) => {
+      const text = payload.text ?? "";
+      const kind = info?.kind ?? "final";
+
+      if (kind === "tool") {
+        appendTaskProgress(chatroomCfg, taskId, {
+          phase: `step_${step.order}_tool`,
+          detail: text.slice(0, 200),
+        });
+        return;
+      }
+
+      if (kind === "block") {
+        appendTaskProgress(chatroomCfg, taskId, {
+          phase: `step_${step.order}_progress`,
+          detail: text.slice(0, 200),
+        });
+        return;
+      }
+
+      if (kind === "final") {
+        // Check if the step was completed via tool call
+        const updatedPlan = readPlan(chatroomCfg, taskId);
+        const updatedStep = updatedPlan?.steps.find((s) => s.step_id === step.step_id);
+        if (updatedStep?.status === "COMPLETED") {
+          stepResult = {
+            success: true,
+            result_summary: updatedStep.result_summary ?? text.slice(0, 500),
+            output_files: updatedStep.output_files,
+          };
+        } else if (updatedStep?.status === "FAILED") {
+          stepResult = {
+            success: false,
+            result_summary: "",
+            output_files: [],
+            error_detail: updatedStep.error_detail ?? "Step failed",
+          };
+        } else if (payload.isError) {
+          stepResult = {
+            success: false,
+            result_summary: "",
+            output_files: [],
+            error_detail: text.slice(0, 500),
+          };
+        } else {
+          // LLM finished but didn't call complete_step — treat as implicit success
+          const producedFiles = scanOutputDir(outputDir);
+          updatePlanStep(chatroomCfg, taskId, step.step_id, {
+            status: "COMPLETED",
+            result_summary: text.slice(0, 500),
+            output_files: producedFiles,
+            completed_at: nowISO(),
+          });
+          stepResult = {
+            success: true,
+            result_summary: text.slice(0, 500),
+            output_files: producedFiles,
+          };
+        }
+      }
+    },
+    onError: (err: any) => {
+      const errType = classifyError(String(err));
+      logger.error(`Step ${step.order} dispatch error [${errType}]: ${err}`);
+      stepResult = {
+        success: false,
+        result_summary: "",
+        output_files: [],
+        error_detail: `LLM error: ${err}`,
+      };
+    },
+  };
+
+  const stepTimeoutMs = Math.min(step.timeout_minutes * 60_000, MAX_STEP_TIMEOUT_MS);
+
+  logger.info(
+    `Dispatching step ${step.order} to LLM (timeout: ${Math.round(stepTimeoutMs / 60000)}min)`,
+  );
+
+  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg: config,
+    dispatcherOptions,
+    replyOptions: {
+      onModelSelected: prefixContext.onModelSelected,
+      toolsDeny: ["message", "feishu_*", "lark_*"],
+      agentTimeoutMs: stepTimeoutMs,
+    },
+  });
+
+  return stepResult;
+}
+
 /**
  * Dispatch a TASK to the LLM. The deliver callback writes a RESULT_REPORT
  * (not a plain CHAT) so the orchestrator's task tracker picks it up.
+ *
+ * This is the LEGACY single-session path, used for simple tasks that skip plan mode.
  */
 async function autoDispatchForTask(
   chatroomCfg: ChatroomConfig,
@@ -2738,6 +3561,192 @@ const agentChatroomPlugin = {
           },
         },
         { names: ["chatroom_cancel_task"] },
+      );
+
+      // ── Tool: approve a task plan ─────────────────────────────────────────
+
+      api.registerTool(
+        {
+          name: "chatroom_approve_plan",
+          label: "Chatroom: Approve Task Plan",
+          description:
+            "Approve (or reject) a worker agent's task plan.\n" +
+            "Once approved, the agent will begin step-by-step execution.\n" +
+            "You can also add comments to individual steps before approving.",
+          parameters: Type.Object({
+            task_id: Type.String({ description: "Task ID whose plan to review" }),
+            decision: Type.Union(
+              [
+                Type.Literal("approved"),
+                Type.Literal("rejected"),
+                Type.Literal("revision_requested"),
+              ],
+              {
+                description: "Your decision: approve, reject, or request revision",
+              },
+            ),
+            reason: Type.Optional(Type.String({ description: "Reason for the decision" })),
+            step_comments: Type.Optional(
+              Type.Array(
+                Type.Object({
+                  step_order: Type.Number({ description: "Step order number (1-based)" }),
+                  comment: Type.String({ description: "Your comment or suggestion for this step" }),
+                  type: Type.Optional(
+                    Type.Union(
+                      [
+                        Type.Literal("suggestion"),
+                        Type.Literal("approval"),
+                        Type.Literal("warning"),
+                        Type.Literal("rejection"),
+                      ],
+                      { description: "Comment type (default: suggestion)" },
+                    ),
+                  ),
+                }),
+                { description: "Optional per-step comments" },
+              ),
+            ),
+          }),
+          async execute(_toolCallId, params) {
+            try {
+              const p = params as {
+                task_id: string;
+                decision: "approved" | "rejected" | "revision_requested";
+                reason?: string;
+                step_comments?: { step_order: number; comment: string; type?: string }[];
+              };
+              const plan = readPlan(cfg, p.task_id);
+              if (!plan) {
+                return {
+                  content: [
+                    { type: "text" as const, text: `Plan not found for task ${p.task_id}` },
+                  ],
+                  details: undefined,
+                };
+              }
+              if (p.step_comments) {
+                for (const sc of p.step_comments) {
+                  const step = plan.steps.find((s) => s.order === sc.step_order);
+                  if (step) {
+                    step.comments.push({
+                      comment_id: randomUUID(),
+                      step_id: step.step_id,
+                      from: cfg.agentId,
+                      text: sc.comment,
+                      timestamp: nowISO(),
+                      type: (sc.type as StepComment["type"]) ?? "suggestion",
+                    });
+                  }
+                }
+              }
+              plan.approval.approved_by = cfg.agentId;
+              plan.approval.decision = p.decision;
+              plan.approval.decision_reason = p.reason ?? null;
+              plan.approval.decided_at = nowISO();
+              if (p.decision === "approved") {
+                plan.status = "APPROVED";
+                plan.approved_at = nowISO();
+              } else if (p.decision === "rejected") {
+                plan.status = "CANCELLED";
+                plan.completed_at = nowISO();
+              } else {
+                plan.status = "DRAFT";
+                plan.revision += 1;
+              }
+              writePlan(cfg, plan);
+              if (p.decision === "rejected") {
+                updateTaskRecord(cfg, p.task_id, {
+                  status: "FAILED",
+                  completed_at: nowISO(),
+                  current_phase: "plan_rejected",
+                  error_detail: `Plan rejected: ${p.reason ?? "no reason"}`,
+                } as Partial<TaskRecord>);
+              }
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text:
+                      `Plan ${p.decision} for task ${p.task_id}.\n` +
+                      (p.reason ? `  reason: ${p.reason}\n` : "") +
+                      (p.step_comments?.length
+                        ? `  step_comments: ${p.step_comments.length}\n`
+                        : "") +
+                      `  plan_status: ${plan.status}`,
+                  },
+                ],
+                details: { plan_status: plan.status, decision: p.decision },
+              };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: `Error: ${err}` }],
+                details: undefined,
+              };
+            }
+          },
+        },
+        { names: ["chatroom_approve_plan"] },
+      );
+
+      // ── Tool: list plans ──────────────────────────────────────────────────
+
+      api.registerTool(
+        {
+          name: "chatroom_list_plans",
+          label: "Chatroom: List Task Plans",
+          description: "List all task plans, optionally filtered by status.",
+          parameters: Type.Object({
+            status: Type.Optional(
+              Type.String({
+                description: "Filter by plan status (e.g. 'DRAFT', 'EXECUTING', 'COMPLETED')",
+              }),
+            ),
+          }),
+          async execute(_toolCallId, params) {
+            try {
+              const p = params as { status?: string };
+              const dir = plansDir(cfg);
+              if (!fs.existsSync(dir)) {
+                return {
+                  content: [{ type: "text" as const, text: "No plans found." }],
+                  details: [],
+                };
+              }
+              let plans: TaskPlan[] = [];
+              for (const f of fs.readdirSync(dir)) {
+                if (!f.endsWith(".json")) continue;
+                const plan = readJson(path.join(dir, f)) as TaskPlan | null;
+                if (plan) plans.push(plan);
+              }
+              if (p.status) {
+                plans = plans.filter((pl) => pl.status === p.status);
+              }
+              plans.sort((a, b) => a.created_at.localeCompare(b.created_at));
+              const summary = plans.map((pl) => ({
+                task_id: pl.task_id,
+                agent: pl.agent_id,
+                status: pl.status,
+                steps: `${pl.steps.filter((s) => s.status === "COMPLETED").length}/${pl.steps.length}`,
+                summary: pl.summary.slice(0, 80),
+              }));
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: plans.length === 0 ? "No plans found." : JSON.stringify(summary, null, 2),
+                  },
+                ],
+                details: summary,
+              };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: `Error: ${err}` }],
+                details: undefined,
+              };
+            }
+          },
+        },
+        { names: ["chatroom_list_plans"] },
       );
     } // end orchestrator-only tools
 
@@ -3765,6 +4774,219 @@ const agentChatroomPlugin = {
         },
       },
       { names: ["chatroom_request_permission"] },
+    );
+
+    // ── Tool: create a structured plan for a task ─────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_create_plan",
+        label: "Chatroom: Create Task Plan",
+        description:
+          "Create a structured execution plan for a task. Call this during the planning phase " +
+          "to break down a complex task into discrete steps.\n\n" +
+          "Each step should be a self-contained unit of work with its own estimated duration.\n" +
+          "The plan will be reviewed (by the orchestrator or a human) before execution begins.\n\n" +
+          "Example:\n" +
+          '  chatroom_create_plan(task_id="abc", summary="Build and publish iOS v2.1",\n' +
+          "    steps=[{title: 'Run tests', description: '...', estimated_minutes: 2, timeout_minutes: 5}, ...])",
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID this plan is for" }),
+          summary: Type.String({ description: "One-line summary of the plan" }),
+          steps: Type.Array(
+            Type.Object({
+              title: Type.String({ description: "Short step title" }),
+              description: Type.String({ description: "Detailed description of what to do" }),
+              estimated_minutes: Type.Number({ description: "Estimated time in minutes" }),
+              timeout_minutes: Type.Optional(
+                Type.Number({
+                  description: "Max timeout for this step (default: 10min, max: 30min)",
+                }),
+              ),
+            }),
+            { description: "Ordered list of steps", minItems: 1 },
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              task_id: string;
+              summary: string;
+              steps: {
+                title: string;
+                description: string;
+                estimated_minutes: number;
+                timeout_minutes?: number;
+              }[];
+            };
+            const approvalMode = getApprovalMode(cfg);
+            const plan = createNewPlan(
+              cfg,
+              p.task_id,
+              cfg.agentId,
+              p.summary,
+              p.steps.map((s, i) => ({
+                order: i + 1,
+                title: s.title,
+                description: s.description,
+                estimated_minutes: s.estimated_minutes,
+                timeout_minutes: s.timeout_minutes ?? DEFAULT_STEP_TIMEOUT_MS / 60_000,
+              })),
+              approvalMode,
+            );
+            updateTaskRecord(cfg, p.task_id, {
+              plan_id: plan.plan_id,
+              total_steps: plan.steps.length,
+              current_phase: "plan_created",
+            } as Partial<TaskRecord>);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `Plan created for task ${p.task_id}.\n` +
+                    `  plan_id: ${plan.plan_id}\n` +
+                    `  steps: ${plan.steps.length}\n` +
+                    `  estimated_total: ${plan.estimated_total_minutes}min\n` +
+                    `  approval_mode: ${approvalMode}\n` +
+                    `  status: DRAFT (awaiting review)`,
+                },
+              ],
+              details: plan,
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error creating plan: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_create_plan"] },
+    );
+
+    // ── Tool: mark a plan step as completed ───────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_complete_step",
+        label: "Chatroom: Complete Plan Step",
+        description:
+          "Mark a plan step as completed and provide a result summary.\n" +
+          "Call this after finishing each step during plan execution.\n\n" +
+          "Example:\n" +
+          '  chatroom_complete_step(task_id="abc", step_id="xyz",\n' +
+          '    result_summary="All 42 tests passed", output_files=["/workspace/out/test-report.txt"])',
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID" }),
+          step_id: Type.String({ description: "The step ID to mark as completed" }),
+          result_summary: Type.String({ description: "Brief summary of what was accomplished" }),
+          output_files: Type.Optional(
+            Type.Array(Type.String(), { description: "Paths to files produced by this step" }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              task_id: string;
+              step_id: string;
+              result_summary: string;
+              output_files?: string[];
+            };
+            const plan = updatePlanStep(cfg, p.task_id, p.step_id, {
+              status: "COMPLETED",
+              result_summary: p.result_summary,
+              output_files: p.output_files ?? [],
+              completed_at: nowISO(),
+            });
+            if (!plan) {
+              return {
+                content: [{ type: "text" as const, text: `Plan not found for task ${p.task_id}` }],
+                details: undefined,
+              };
+            }
+            const completed = plan.steps.filter((s) => s.status === "COMPLETED").length;
+            updateTaskRecord(cfg, p.task_id, {
+              current_step: completed,
+              current_phase: `step_${completed}/${plan.steps.length}`,
+            } as Partial<TaskRecord>);
+            appendTaskProgress(cfg, p.task_id, {
+              phase: `step_completed`,
+              detail: `Step ${completed}/${plan.steps.length}: ${p.result_summary.slice(0, 200)}`,
+            });
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `Step completed: ${p.step_id}\n` +
+                    `  progress: ${completed}/${plan.steps.length}\n` +
+                    `  result: ${p.result_summary}`,
+                },
+              ],
+              details: { completed, total: plan.steps.length },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error completing step: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_complete_step"] },
+    );
+
+    // ── Tool: fail a plan step ────────────────────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_fail_step",
+        label: "Chatroom: Fail Plan Step",
+        description:
+          "Mark a plan step as failed with an error detail.\n" +
+          "The system will decide whether to retry or abort the remaining steps.",
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID" }),
+          step_id: Type.String({ description: "The step ID that failed" }),
+          error_detail: Type.String({ description: "What went wrong" }),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as { task_id: string; step_id: string; error_detail: string };
+            const plan = updatePlanStep(cfg, p.task_id, p.step_id, {
+              status: "FAILED",
+              error_detail: p.error_detail,
+              completed_at: nowISO(),
+            });
+            if (!plan) {
+              return {
+                content: [{ type: "text" as const, text: `Plan not found for task ${p.task_id}` }],
+                details: undefined,
+              };
+            }
+            appendTaskProgress(cfg, p.task_id, {
+              phase: "step_failed",
+              detail: p.error_detail.slice(0, 200),
+            });
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Step failed: ${p.step_id}\n  error: ${p.error_detail}`,
+                },
+              ],
+              details: undefined,
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_fail_step"] },
     );
 
     // ── Background service ──────────────────────────────────────────────────
