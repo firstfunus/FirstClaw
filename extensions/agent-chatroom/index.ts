@@ -1412,7 +1412,12 @@ function dispatchTask(
   to: string,
   instruction: string,
   logger: Logger,
-  opts?: { ackTimeoutMs?: number; taskTimeoutMs?: number; maxRetries?: number },
+  opts?: {
+    ackTimeoutMs?: number;
+    taskTimeoutMs?: number;
+    maxRetries?: number;
+    longRunning?: boolean;
+  },
 ): TaskRecord {
   const channelId = `dm_${to}`;
   const task = createTaskRecord(cfg, to, channelId, instruction, opts);
@@ -1425,6 +1430,7 @@ function dispatchTask(
     priority: "urgent",
     output_dir: outputDir,
     task_timeout_ms: task.task_timeout_ms,
+    long_running: opts?.longRunning ?? false,
   });
 
   logger.info(`Task ${task.task_id} dispatched to ${to} via #${channelId} (output: ${outputDir})`);
@@ -2570,9 +2576,13 @@ async function autoDispatchMessage(
 // ============================================================================
 
 function shouldUsePlanMode(instruction: string, isLongRunning: boolean): boolean {
+  // Plan Mode is ON by default for all tasks.
+  // Only skip for extremely trivial instructions (< 5 words, no newlines).
   if (isLongRunning) return true;
-  const wordCount = instruction.split(/\s+/).length;
-  return wordCount > 30;
+  const trimmed = instruction.trim();
+  const wordCount = trimmed.split(/\s+/).length;
+  if (wordCount < 5 && !trimmed.includes("\n")) return false;
+  return true;
 }
 
 /**
@@ -3406,6 +3416,7 @@ const agentChatroomPlugin = {
               }
               const task = dispatchTask(cfg, p.target, instruction, logger, {
                 taskTimeoutMs: timeoutMs,
+                longRunning: p.long_running,
               });
               return {
                 content: [
