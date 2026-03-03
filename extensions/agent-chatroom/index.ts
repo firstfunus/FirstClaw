@@ -445,6 +445,34 @@ function toForwardSlash(p: string): string {
   return p.replace(/\\/g, "/");
 }
 
+/**
+ * Convert an absolute NAS path to a path relative to the NAS root.
+ * E.g. "/Volumes/Projects/chatroom/assets/art/task/file.png"
+ *   → "chatroom/assets/art/task/file.png"
+ * If the path is already relative or doesn't start with nasRoot, return as-is.
+ */
+function toNasRelativePath(cfg: ChatroomConfig, absPath: string): string {
+  const nasRoot = toForwardSlash(cfg.nasRoot);
+  const normalized = toForwardSlash(absPath);
+  if (normalized.startsWith(nasRoot + "/")) {
+    return normalized.slice(nasRoot.length + 1);
+  }
+  if (normalized.startsWith(nasRoot)) {
+    return normalized.slice(nasRoot.length);
+  }
+  return normalized;
+}
+
+/**
+ * Resolve a NAS-relative path back to an absolute path using this agent's NAS root.
+ * E.g. "chatroom/assets/art/task/file.png"
+ *   → "/Volumes/Projects/chatroom/assets/art/task/file.png"
+ */
+function fromNasRelativePath(cfg: ChatroomConfig, relPath: string): string {
+  if (path.isAbsolute(relPath)) return relPath;
+  return path.join(cfg.nasRoot, relPath);
+}
+
 function scanOutputDir(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   const files: string[] = [];
@@ -1507,17 +1535,18 @@ function sendTaskResult(
     logger.warn(`Cannot send result — task ${taskId} not found`);
     return;
   }
+  const relativeAssetPaths = assetPaths.map((p) => toNasRelativePath(cfg, p));
   sendMessageToNAS(cfg, task.channel_id, resultText, "RESULT_REPORT", [task.from], undefined, {
     task_id: taskId,
     status,
-    asset_paths: assetPaths,
+    asset_paths: relativeAssetPaths,
     error_type: errorType ?? undefined,
   });
   const patch: Partial<TaskRecord> = {
     status,
     completed_at: nowISO(),
     result_summary: resultText.slice(0, 500),
-    asset_paths: assetPaths,
+    asset_paths: relativeAssetPaths,
   };
   if (errorType) {
     patch.error_type = errorType;
@@ -2251,6 +2280,25 @@ function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger
     },
   );
   logger.info(`RESULT_ACK sent for task ${taskId} → ${msg.from}`);
+
+  // Orchestrator: broadcast completion summary to #general so humans can see it
+  if (cfg.role === "orchestrator") {
+    const assetPaths = (msg.metadata?.asset_paths as string[] | undefined) ?? [];
+    const assetNote =
+      assetPaths.length > 0
+        ? `\n\nOutput files (${assetPaths.length}):\n${assetPaths.map((p) => `- \`${toNasRelativePath(cfg, p)}\``).join("\n")}`
+        : "";
+    const statusEmoji = resultStatus === "DONE" ? "✅" : "❌";
+    const summary =
+      `${statusEmoji} **Task completed** by **${msg.from}** (task \`${taskId.slice(0, 8)}\`)\n\n` +
+      `${msg.content.text.slice(0, 800)}${msg.content.text.length > 800 ? "..." : ""}` +
+      assetNote;
+    sendMessageToNAS(cfg, "general", summary, "CHAT", [], undefined, {
+      task_id: taskId,
+      asset_paths: assetPaths.map((p) => toNasRelativePath(cfg, p)),
+    });
+    logger.info(`Task completion summary posted to #general for task ${taskId}`);
+  }
 }
 
 // ============================================================================
@@ -2571,10 +2619,12 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
     ``,
     `═══ File System (NAS) ═══`,
-    `  Your output dir: ${myAssets}`,
-    `  Shared dir: ${sharedAssets}`,
-    `  All agent assets: ${assetsDir(cfg)}`,
+    `  All asset paths are stored as NAS-ROOT RELATIVE paths for cross-machine compatibility.`,
+    `  Your output dir: ${toNasRelativePath(cfg, myAssets)}`,
+    `  Shared dir: ${toNasRelativePath(cfg, sharedAssets)}`,
+    `  All agent assets: ${toNasRelativePath(cfg, assetsDir(cfg))}`,
     `  When dispatching a task, the system auto-creates an output dir for the target.`,
+    `  Agents on different machines may have different NAS mount points — relative paths ensure portability.`,
     ``,
   ];
 
@@ -2722,7 +2772,9 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  Otherwise your session will pause until an admin decides.`,
     ``,
     `═══ File System (NAS) ═══`,
-    `  Your output dir: ${myAssets}`,
+    `  All asset paths are stored as NAS-ROOT RELATIVE paths for cross-machine compatibility.`,
+    `  Your output dir: ${toNasRelativePath(cfg, myAssets)}`,
+    `  To access files from other agents, resolve their relative path with your own NAS root.`,
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
     ``,
     `═══ RAG (Project Knowledge) ═══`,
@@ -4135,17 +4187,18 @@ const agentChatroomPlugin = {
             const detectedPath = detectMisusedFilePath(p.content);
             if (detectedPath) {
               const result = publishFileToNAS(detectedPath, dir, p.filename);
+              const relPath = toNasRelativePath(cfg, result.nasPath);
               return {
                 content: [
                   {
                     type: "text" as const,
                     text:
                       `[AUTO-CORRECTED] Detected file path in content — copied file directly instead.\n` +
-                      `File published to NAS (verified): ${result.nasPath} (${formatFileSize(result.sourceSize)}, MD5: ${result.md5})\n` +
+                      `File published to NAS (verified): ${relPath} (${formatFileSize(result.sourceSize)}, MD5: ${result.md5})\n` +
                       `TIP: Next time, use chatroom_publish_file(source_path="${detectedPath}") for binary files.`,
                   },
                 ],
-                details: result,
+                details: { ...result, nasPath: relPath },
               };
             }
 
@@ -4155,6 +4208,7 @@ const agentChatroomPlugin = {
             if (p.encoding === "base64") {
               const buf = Buffer.from(p.content, "base64");
               fs.writeFileSync(filePath, buf);
+              const relPath = toNasRelativePath(cfg, filePath);
               const ext = path.extname(p.filename).toLowerCase();
               const sizeNote =
                 buf.length > 512 * 1024
@@ -4167,22 +4221,23 @@ const agentChatroomPlugin = {
                 content: [
                   {
                     type: "text" as const,
-                    text: `File saved: ${filePath} (${formatFileSize(buf.length)})${sizeNote}${binNote}`,
+                    text: `File saved: ${relPath} (${formatFileSize(buf.length)})${sizeNote}${binNote}`,
                   },
                 ],
-                details: { path: filePath, size: buf.length },
+                details: { path: relPath, size: buf.length },
               };
             }
 
             fs.writeFileSync(filePath, p.content, "utf-8");
+            const relPath = toNasRelativePath(cfg, filePath);
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `File saved: ${filePath} (${fs.statSync(filePath).size} bytes)`,
+                  text: `File saved: ${relPath} (${fs.statSync(filePath).size} bytes)`,
                 },
               ],
-              details: { path: filePath, size: fs.statSync(filePath).size },
+              details: { path: relPath, size: fs.statSync(filePath).size },
             };
           } catch (err) {
             return {
@@ -4347,6 +4402,7 @@ const agentChatroomPlugin = {
             const detectedPath = detectMisusedFilePath(p.content);
             if (detectedPath) {
               const pubResult = publishFileToNAS(detectedPath, dir, p.filename);
+              const relPath = toNasRelativePath(cfg, pubResult.nasPath);
               const displayName = p.filename ?? path.basename(detectedPath);
               const msgText = p.text ?? `📎 ${displayName}`;
               const sendResult = sendMessageToNAS(
@@ -4357,7 +4413,7 @@ const agentChatroomPlugin = {
                 [],
                 undefined,
                 {
-                  asset_paths: [pubResult.nasPath],
+                  asset_paths: [relPath],
                 },
               );
               return {
@@ -4385,9 +4441,10 @@ const agentChatroomPlugin = {
             }
 
             const fileSize = fs.statSync(filePath).size;
+            const relPath = toNasRelativePath(cfg, filePath);
             const msgText = p.text ?? `📎 ${p.filename}`;
             const result = sendMessageToNAS(cfg, p.channel_id, msgText, "CHAT", [], undefined, {
-              asset_paths: [filePath],
+              asset_paths: [relPath],
             });
 
             return {
@@ -4396,7 +4453,7 @@ const agentChatroomPlugin = {
                   type: "text" as const,
                   text:
                     `File uploaded and message sent to #${p.channel_id} (seq: ${result.seq})\n` +
-                    `  Path: ${filePath} (${fileSize} bytes)`,
+                    `  Path: ${relPath} (${fileSize} bytes)`,
                 },
               ],
               details: { path: filePath, size: fileSize, seq: result.seq },
@@ -4453,6 +4510,7 @@ const agentChatroomPlugin = {
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
             const result = publishFileToNAS(p.source_path, dir, p.filename);
+            const relPath = toNasRelativePath(cfg, result.nasPath);
             return {
               content: [
                 {
@@ -4460,12 +4518,12 @@ const agentChatroomPlugin = {
                   text:
                     `File published to NAS (verified):\n` +
                     `  Source: ${p.source_path}\n` +
-                    `  NAS path: ${result.nasPath}\n` +
+                    `  NAS path (relative): ${relPath}\n` +
                     `  Size: ${formatFileSize(result.sourceSize)}\n` +
                     `  MD5: ${result.md5}`,
                 },
               ],
-              details: result,
+              details: { ...result, nasPath: relPath },
             };
           } catch (err) {
             return {
@@ -4544,11 +4602,12 @@ const agentChatroomPlugin = {
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
             const result = publishFileToNAS(p.source_path, dir, p.filename);
+            const relPath = toNasRelativePath(cfg, result.nasPath);
 
             const displayName = p.filename ?? path.basename(p.source_path);
             const msgText = p.text ?? `📎 ${displayName}`;
             const sendResult = sendMessageToNAS(cfg, p.channel_id, msgText, "CHAT", [], undefined, {
-              asset_paths: [result.nasPath],
+              asset_paths: [relPath],
             });
 
             return {
@@ -4557,7 +4616,7 @@ const agentChatroomPlugin = {
                   type: "text" as const,
                   text:
                     `File published and message sent to #${p.channel_id} (seq: ${sendResult.seq}, verified):\n` +
-                    `  NAS path: ${result.nasPath}\n` +
+                    `  NAS path: ${relPath}\n` +
                     `  Size: ${formatFileSize(result.sourceSize)} | MD5: ${result.md5}`,
                 },
               ],
@@ -4613,15 +4672,16 @@ const agentChatroomPlugin = {
               targetDir = p.task_id ? taskAssetsDir(cfg, scope, p.task_id) : assetsDir(cfg, scope);
             }
 
+            const relDir = toNasRelativePath(cfg, targetDir);
             if (!fs.existsSync(targetDir)) {
               return {
                 content: [
                   {
                     type: "text" as const,
-                    text: `Directory does not exist: ${targetDir}`,
+                    text: `Directory does not exist: ${relDir}`,
                   },
                 ],
-                details: { files: [], dir: targetDir },
+                details: { files: [], dir: relDir },
               };
             }
 
@@ -4635,7 +4695,7 @@ const agentChatroomPlugin = {
                 const stat = fs.statSync(fullPath);
                 files.push({
                   name: entry.name,
-                  path: fullPath,
+                  path: toNasRelativePath(cfg, fullPath),
                   size: formatFileSize(stat.size),
                   type: path.extname(entry.name).toLowerCase() || "(no ext)",
                 });
@@ -4644,7 +4704,7 @@ const agentChatroomPlugin = {
               }
             }
 
-            const lines: string[] = [`Directory: ${targetDir}`];
+            const lines: string[] = [`Directory: ${relDir}`];
             if (dirs.length > 0) {
               lines.push(`Subdirectories: ${dirs.join(", ")}`);
             }
@@ -4659,7 +4719,7 @@ const agentChatroomPlugin = {
 
             return {
               content: [{ type: "text" as const, text: lines.join("\n") }],
-              details: { dir: targetDir, files, dirs },
+              details: { dir: relDir, files, dirs },
             };
           } catch (err) {
             return {
