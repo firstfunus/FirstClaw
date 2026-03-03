@@ -63,6 +63,7 @@ type TaskStatus =
   | "DISPATCHED"
   | "ACKED"
   | "PROCESSING"
+  | "DELIVERED"
   | "DONE"
   | "FAILED"
   | "TIMEOUT"
@@ -78,6 +79,8 @@ interface ProgressEntry {
   phase: string;
   detail?: string;
 }
+
+type ResumeStrategy = "continue" | "restart" | "wait_and_check";
 
 interface TaskRecord {
   task_id: string;
@@ -103,6 +106,7 @@ interface TaskRecord {
   plan_id?: string | null;
   current_step?: number | null;
   total_steps?: number | null;
+  resume_strategy?: ResumeStrategy;
 }
 
 // ── Plan Mode types ──────────────────────────────────────────────────────────
@@ -473,6 +477,47 @@ function fromNasRelativePath(cfg: ChatroomConfig, relPath: string): string {
   return path.join(cfg.nasRoot, relPath);
 }
 
+// ============================================================================
+// Chatroom URI Protocol — cross-machine asset path resolution
+//
+//   chatroom://assets/{agentId}/{taskId}/{filename}
+//
+// Every agent resolves this URI against its own NAS mount point.
+// ============================================================================
+
+const CHATROOM_URI_PREFIX = "chatroom://";
+
+function isChatroomUri(s: string): boolean {
+  return s.startsWith(CHATROOM_URI_PREFIX);
+}
+
+/**
+ * Convert an absolute NAS path to a chatroom:// URI.
+ * E.g. "/Volumes/Projects/chatroom/assets/art/task/file.png"
+ *   → "chatroom://assets/art/task/file.png"
+ */
+function toChatroomUri(absPath: string, cfg: ChatroomConfig): string {
+  const rel = toNasRelativePath(cfg, absPath);
+  // Strip leading "chatroom/" if present since the URI scheme already implies it
+  const stripped = rel.startsWith("chatroom/") ? rel.slice("chatroom/".length) : rel;
+  return `${CHATROOM_URI_PREFIX}${stripped}`;
+}
+
+/**
+ * Resolve a chatroom:// URI (or legacy path) to an absolute local path.
+ * Accepts:
+ *   - "chatroom://assets/art/task/file.png"  → "{nasRoot}/chatroom/assets/art/task/file.png"
+ *   - "chatroom/assets/art/task/file.png"    → "{nasRoot}/chatroom/assets/art/task/file.png"  (legacy relative)
+ *   - "/Volumes/Projects/chatroom/..."       → as-is  (legacy absolute)
+ */
+function fromChatroomUri(uri: string, cfg: ChatroomConfig): string {
+  if (uri.startsWith(CHATROOM_URI_PREFIX)) {
+    const relPart = uri.slice(CHATROOM_URI_PREFIX.length);
+    return path.join(cfg.nasRoot, "chatroom", relPart);
+  }
+  return fromNasRelativePath(cfg, uri);
+}
+
 function scanOutputDir(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   const files: string[] = [];
@@ -480,6 +525,479 @@ function scanOutputDir(dir: string): string[] {
     if (entry.isFile()) files.push(toForwardSlash(path.join(dir, entry.name)));
   }
   return files;
+}
+
+// ============================================================================
+// NAS Health Monitor — state machine: ONLINE → DEGRADED → OFFLINE
+// ============================================================================
+
+type NasHealthState = "ONLINE" | "DEGRADED" | "OFFLINE";
+
+interface NasHealthMonitor {
+  state: NasHealthState;
+  consecutiveFailures: number;
+  lastCheckTime: string;
+  offlineSince: string | null;
+  timer: ReturnType<typeof setInterval> | null;
+  listeners: Array<(state: NasHealthState, prev: NasHealthState) => void>;
+}
+
+const DEGRADED_THRESHOLD = 1;
+const OFFLINE_THRESHOLD = 3;
+const NAS_CHECK_INTERVAL_MS = 5_000;
+const MAX_OFFLINE_BUFFER_MINUTES = 30;
+
+let _nasHealth: NasHealthMonitor = {
+  state: "ONLINE",
+  consecutiveFailures: 0,
+  lastCheckTime: "",
+  offlineSince: null,
+  timer: null,
+  listeners: [],
+};
+
+function isNasOnline(): boolean {
+  return _nasHealth.state === "ONLINE";
+}
+
+function getNasHealthState(): NasHealthState {
+  return _nasHealth.state;
+}
+
+function nasOfflineDurationMs(): number {
+  if (!_nasHealth.offlineSince) return 0;
+  return Date.now() - new Date(_nasHealth.offlineSince).getTime();
+}
+
+function isNasBufferExpired(): boolean {
+  return nasOfflineDurationMs() > MAX_OFFLINE_BUFFER_MINUTES * 60_000;
+}
+
+function onNasStateChange(cb: (state: NasHealthState, prev: NasHealthState) => void): void {
+  _nasHealth.listeners.push(cb);
+}
+
+function checkNasAccess(nasRoot: string): boolean {
+  try {
+    fs.accessSync(nasRoot, fs.constants.R_OK | fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function startNasHealthMonitor(cfg: ChatroomConfig, logger: Logger): void {
+  if (_nasHealth.timer) return;
+
+  const doCheck = () => {
+    const ok = checkNasAccess(cfg.nasRoot);
+    const prev = _nasHealth.state;
+    _nasHealth.lastCheckTime = nowISO();
+
+    if (ok) {
+      _nasHealth.consecutiveFailures = 0;
+      if (prev !== "ONLINE") {
+        _nasHealth.state = "ONLINE";
+        _nasHealth.offlineSince = null;
+        logger.info(`[nas-health] NAS recovered → ONLINE`);
+        for (const cb of _nasHealth.listeners) {
+          try {
+            cb("ONLINE", prev);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } else {
+      _nasHealth.consecutiveFailures++;
+      let newState: NasHealthState;
+      if (_nasHealth.consecutiveFailures >= OFFLINE_THRESHOLD) {
+        newState = "OFFLINE";
+      } else if (_nasHealth.consecutiveFailures >= DEGRADED_THRESHOLD) {
+        newState = "DEGRADED";
+      } else {
+        newState = prev;
+      }
+      if (newState !== prev) {
+        _nasHealth.state = newState;
+        if (newState === "OFFLINE" && !_nasHealth.offlineSince) {
+          _nasHealth.offlineSince = nowISO();
+        }
+        logger.warn(
+          `[nas-health] NAS state: ${prev} → ${newState} (failures: ${_nasHealth.consecutiveFailures})`,
+        );
+        for (const cb of _nasHealth.listeners) {
+          try {
+            cb(newState, prev);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+  };
+
+  doCheck();
+  _nasHealth.timer = setInterval(doCheck, NAS_CHECK_INTERVAL_MS);
+  logger.info(`[nas-health] Monitor started (check every ${NAS_CHECK_INTERVAL_MS / 1000}s)`);
+}
+
+function stopNasHealthMonitor(): void {
+  if (_nasHealth.timer) {
+    clearInterval(_nasHealth.timer);
+    _nasHealth.timer = null;
+  }
+}
+
+// ============================================================================
+// Write-Ahead Log (WAL) + Local Staging
+// ============================================================================
+
+interface WalEntry {
+  id: string;
+  timestamp: string;
+  op: "FILE_COPY" | "FILE_WRITE" | "JSON_WRITE" | "MESSAGE_SEND" | "TASK_UPDATE" | "INBOX_NOTIFY";
+  localPath: string;
+  nasPath: string;
+  metadata?: Record<string, unknown>;
+  status: "pending" | "synced" | "failed";
+  retries: number;
+}
+
+function walPath(cfg: ChatroomConfig): string {
+  return path.join(cfg.localDir, "wal.jsonl");
+}
+
+function stagedDir(cfg: ChatroomConfig): string {
+  return path.join(cfg.localDir, "staged");
+}
+
+function appendWal(
+  cfg: ChatroomConfig,
+  entry: Omit<WalEntry, "id" | "timestamp" | "status" | "retries">,
+): WalEntry {
+  const full: WalEntry = {
+    id: randomUUID(),
+    timestamp: nowISO(),
+    status: "pending",
+    retries: 0,
+    ...entry,
+  };
+  const walFile = walPath(cfg);
+  ensureDir(path.dirname(walFile));
+  fs.appendFileSync(walFile, JSON.stringify(full) + "\n", "utf-8");
+  return full;
+}
+
+function readWal(cfg: ChatroomConfig): WalEntry[] {
+  const walFile = walPath(cfg);
+  if (!fs.existsSync(walFile)) return [];
+  const lines = fs.readFileSync(walFile, "utf-8").split("\n").filter(Boolean);
+  return lines.map((l) => JSON.parse(l) as WalEntry);
+}
+
+function rewriteWal(cfg: ChatroomConfig, entries: WalEntry[]): void {
+  const walFile = walPath(cfg);
+  ensureDir(path.dirname(walFile));
+  fs.writeFileSync(walFile, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+}
+
+function stagedPathFor(cfg: ChatroomConfig, chatroomUri: string): string {
+  const rel = chatroomUri.startsWith(CHATROOM_URI_PREFIX)
+    ? chatroomUri.slice(CHATROOM_URI_PREFIX.length)
+    : chatroomUri;
+  return path.join(stagedDir(cfg), rel);
+}
+
+// ── NAS-aware write primitives ──────────────────────────────────────────────
+
+function nasWriteFile(cfg: ChatroomConfig, absNasPath: string, data: Buffer | string): void {
+  if (isNasOnline()) {
+    ensureDir(path.dirname(absNasPath));
+    fs.writeFileSync(absNasPath, data);
+  } else {
+    const uri = toChatroomUri(absNasPath, cfg);
+    const staged = stagedPathFor(cfg, uri);
+    ensureDir(path.dirname(staged));
+    fs.writeFileSync(staged, data);
+    appendWal(cfg, { op: "FILE_WRITE", localPath: staged, nasPath: uri });
+  }
+}
+
+function nasCopyFile(cfg: ChatroomConfig, sourcePath: string, absNasDest: string): void {
+  if (isNasOnline()) {
+    ensureDir(path.dirname(absNasDest));
+    fs.copyFileSync(sourcePath, absNasDest);
+  } else {
+    const uri = toChatroomUri(absNasDest, cfg);
+    const staged = stagedPathFor(cfg, uri);
+    ensureDir(path.dirname(staged));
+    fs.copyFileSync(sourcePath, staged);
+    appendWal(cfg, { op: "FILE_COPY", localPath: staged, nasPath: uri });
+  }
+}
+
+function nasWriteJson(cfg: ChatroomConfig, absNasPath: string, data: any): void {
+  const content = JSON.stringify(data, null, 2);
+  if (isNasOnline()) {
+    ensureDir(path.dirname(absNasPath));
+    fs.writeFileSync(absNasPath, content, "utf-8");
+  } else {
+    const uri = toChatroomUri(absNasPath, cfg);
+    const staged = stagedPathFor(cfg, uri);
+    ensureDir(path.dirname(staged));
+    fs.writeFileSync(staged, content, "utf-8");
+    appendWal(cfg, { op: "JSON_WRITE", localPath: staged, nasPath: uri });
+  }
+}
+
+// ============================================================================
+// Sync Manager — replays WAL entries when NAS recovers
+// ============================================================================
+
+const WAL_MAX_RETRIES = 3;
+
+function syncWalEntries(cfg: ChatroomConfig, logger: Logger): void {
+  const entries = readWal(cfg);
+  const pending = entries.filter((e) => e.status === "pending");
+  if (pending.length === 0) return;
+
+  logger.info(`[sync] Replaying ${pending.length} WAL entries...`);
+
+  // Sort by timestamp to maintain causal order
+  pending.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+  let synced = 0;
+  let failed = 0;
+
+  for (const entry of pending) {
+    try {
+      switch (entry.op) {
+        case "FILE_COPY":
+        case "FILE_WRITE":
+        case "JSON_WRITE": {
+          const dest = fromChatroomUri(entry.nasPath, cfg);
+          // Conflict detection: if NAS file exists and is newer, skip
+          if (fs.existsSync(dest)) {
+            try {
+              const nasMtime = fs.statSync(dest).mtimeMs;
+              const entryTime = new Date(entry.timestamp).getTime();
+              if (nasMtime > entryTime) {
+                logger.info(`[sync] Skipped ${entry.id} — NAS file is newer`);
+                entry.status = "synced";
+                synced++;
+                continue;
+              }
+            } catch {
+              /* proceed with copy */
+            }
+          }
+          ensureDir(path.dirname(dest));
+          fs.copyFileSync(entry.localPath, dest);
+          entry.status = "synced";
+          synced++;
+          break;
+        }
+
+        case "MESSAGE_SEND": {
+          // Re-send the buffered message through the normal NAS path.
+          // The message was serialised to staged; read and write to NAS.
+          const msgData = readJson(entry.localPath);
+          if (!msgData) {
+            entry.status = "failed";
+            failed++;
+            break;
+          }
+          const channelId = msgData.channel_id as string;
+          const root = chatroomRoot(cfg);
+          const chDir = path.join(root, "channels", channelId);
+          const msgDir = path.join(chDir, "messages");
+          const metaPath = path.join(chDir, "meta.json");
+          const lockPath = path.join(chDir, ".lock");
+
+          ensureDir(msgDir);
+          if (acquireLock(lockPath, cfg.agentId)) {
+            try {
+              const meta = readJson(metaPath) ?? { last_message_seq: 0, message_count: 0 };
+              const seq = (meta.last_message_seq ?? 0) + 1;
+              msgData.seq = seq;
+              const ts = (msgData.timestamp as string) ?? "";
+              const tsCompact = ts.replace(/[-:]/g, "").replace(/\.\d+/, "").replace("T", "T");
+              const filename = `${String(seq).padStart(6, "0")}_${tsCompact}_${msgData.message_id}.json`;
+              writeJson(path.join(msgDir, filename), msgData);
+              meta.last_message_seq = seq;
+              meta.message_count = (meta.message_count ?? 0) + 1;
+              writeJson(metaPath, meta);
+
+              // Send inbox notifications for buffered messages
+              const members: string[] = meta.members ?? [];
+              const mentions: string[] = (entry.metadata?.mentions as string[]) ?? [];
+              const notifySet = new Set(members);
+              for (const m of mentions) notifySet.add(m);
+              notifySet.delete(cfg.agentId);
+              for (const target of notifySet) {
+                const isMentioned = mentions.includes(target);
+                const inboxDir = path.join(root, "inbox", target);
+                ensureDir(inboxDir);
+                const notif = {
+                  notification_id: randomUUID(),
+                  timestamp: msgData.timestamp,
+                  channel_id: channelId,
+                  message_seq: seq,
+                  from: cfg.agentId,
+                  preview: ((msgData.content as any)?.text ?? "").slice(0, 120),
+                  priority: isMentioned ? "high" : "normal",
+                  mentioned: isMentioned,
+                };
+                writeJson(
+                  path.join(
+                    inboxDir,
+                    `${String(seq).padStart(6, "0")}_${notif.notification_id}.json`,
+                  ),
+                  notif,
+                );
+              }
+
+              entry.status = "synced";
+              synced++;
+            } finally {
+              releaseLock(lockPath);
+            }
+          } else {
+            entry.retries++;
+            failed++;
+          }
+          break;
+        }
+
+        case "TASK_UPDATE": {
+          const dest = fromChatroomUri(entry.nasPath, cfg);
+          const patch = readJson(entry.localPath);
+          if (!patch) {
+            entry.status = "failed";
+            failed++;
+            break;
+          }
+          const existing = readJson(dest);
+          if (existing) {
+            writeJson(dest, { ...existing, ...patch });
+          } else {
+            ensureDir(path.dirname(dest));
+            writeJson(dest, patch);
+          }
+          entry.status = "synced";
+          synced++;
+          break;
+        }
+
+        case "INBOX_NOTIFY": {
+          const dest = fromChatroomUri(entry.nasPath, cfg);
+          ensureDir(path.dirname(dest));
+          fs.copyFileSync(entry.localPath, dest);
+          entry.status = "synced";
+          synced++;
+          break;
+        }
+      }
+    } catch (err) {
+      entry.retries++;
+      if (entry.retries >= WAL_MAX_RETRIES) {
+        entry.status = "failed";
+        logger.error(
+          `[sync] WAL entry ${entry.id} failed permanently after ${WAL_MAX_RETRIES} retries: ${err}`,
+        );
+      } else {
+        logger.warn(
+          `[sync] WAL entry ${entry.id} failed (retry ${entry.retries}/${WAL_MAX_RETRIES}): ${err}`,
+        );
+      }
+      failed++;
+    }
+  }
+
+  // Rewrite WAL, removing synced entries. Keep failed for inspection.
+  const remaining = entries.filter((e) => e.status !== "synced");
+  if (remaining.length === 0) {
+    try {
+      fs.unlinkSync(walPath(cfg));
+    } catch {
+      /* ignore */
+    }
+  } else {
+    rewriteWal(cfg, remaining);
+  }
+
+  // Clean up staged files for synced entries
+  for (const entry of pending) {
+    if (entry.status === "synced") {
+      try {
+        fs.unlinkSync(entry.localPath);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  logger.info(
+    `[sync] WAL replay complete: ${synced} synced, ${failed} failed, ${remaining.length} remaining`,
+  );
+}
+
+// ============================================================================
+// Resume strategy — applied when NAS comes back online
+// ============================================================================
+
+function applyResumeStrategies(cfg: ChatroomConfig, logger: Logger): void {
+  const dir = tasksDir(cfg);
+  if (!fs.existsSync(dir)) return;
+
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+  for (const file of files) {
+    const task = readJson(path.join(dir, file)) as TaskRecord | null;
+    if (!task) continue;
+    if (task.current_phase !== "nas_offline_buffering") continue;
+
+    const strategy = task.resume_strategy ?? "restart";
+    logger.info(`[resume] Task ${task.task_id} (${task.to}): applying strategy "${strategy}"`);
+
+    switch (strategy) {
+      case "continue":
+        // Simply update the phase — the agent's LLM session can continue from
+        // where it left off since files were buffered locally and now synced.
+        updateTaskRecord(cfg, task.task_id, { current_phase: "resumed_after_offline" });
+        appendTaskProgress(cfg, task.task_id, {
+          phase: "resumed_after_offline",
+          detail: "NAS recovered; continuing from buffered state",
+        });
+        break;
+
+      case "wait_and_check":
+        // The external process (e.g. CI build) may still be running.
+        // Mark as waiting and let the park monitor or next poll handle it.
+        updateTaskRecord(cfg, task.task_id, { current_phase: "checking_external" });
+        appendTaskProgress(cfg, task.task_id, {
+          phase: "checking_external",
+          detail: "NAS recovered; checking if external process completed during offline period",
+        });
+        break;
+
+      case "restart":
+      default:
+        // Task needs a full restart — mark failed so the retry system handles it
+        updateTaskRecord(cfg, task.task_id, {
+          status: "FAILED",
+          current_phase: "restart_after_offline",
+          error_type: "TOOL_ERROR",
+          error_detail: "NAS was offline during task execution; restarting per resume_strategy",
+          completed_at: nowISO(),
+        });
+        appendTaskProgress(cfg, task.task_id, {
+          phase: "restart_after_offline",
+          detail: "NAS recovered; task will be retried from the beginning",
+        });
+        break;
+    }
+  }
 }
 
 // ============================================================================
@@ -502,8 +1020,16 @@ interface PublishResult {
 /**
  * Binary-safe copy from local filesystem to NAS with integrity verification.
  * Uses fs.copyFileSync (kernel-level copy) — never passes content through LLM context.
+ *
+ * When *nasCfg* is provided and NAS is offline, the file is staged locally
+ * and a WAL entry is created for later sync.
  */
-function publishFileToNAS(sourcePath: string, destDir: string, filename?: string): PublishResult {
+function publishFileToNAS(
+  sourcePath: string,
+  destDir: string,
+  filename?: string,
+  nasCfg?: ChatroomConfig,
+): PublishResult {
   if (!fs.existsSync(sourcePath)) {
     throw new Error(`Source file does not exist: ${sourcePath}`);
   }
@@ -516,17 +1042,31 @@ function publishFileToNAS(sourcePath: string, destDir: string, filename?: string
   }
 
   const targetName = filename ?? path.basename(sourcePath);
-  ensureDir(destDir);
   const destPath = toForwardSlash(path.join(destDir, targetName));
-
   const sourceMd5 = md5File(sourcePath);
+
+  if (nasCfg && !isNasOnline()) {
+    const uri = toChatroomUri(destPath, nasCfg);
+    const staged = stagedPathFor(nasCfg, uri);
+    ensureDir(path.dirname(staged));
+    fs.copyFileSync(sourcePath, staged);
+    appendWal(nasCfg, { op: "FILE_COPY", localPath: staged, nasPath: uri });
+    return {
+      nasPath: destPath,
+      sourceSize: stat.size,
+      destSize: stat.size,
+      md5: sourceMd5,
+      verified: true,
+    };
+  }
+
+  ensureDir(destDir);
   fs.copyFileSync(sourcePath, destPath);
 
   const destStat = fs.statSync(destPath);
   const destMd5 = md5File(destPath);
 
   if (destStat.size !== stat.size || destMd5 !== sourceMd5) {
-    // Retry once
     fs.copyFileSync(sourcePath, destPath);
     const retryStat = fs.statSync(destPath);
     const retryMd5 = md5File(destPath);
@@ -819,6 +1359,36 @@ function sendMessageToNAS(
   replyTo?: string,
   metadata?: Record<string, any>,
 ): { message_id: string; seq: number } {
+  const messageId = randomUUID();
+  const timestamp = nowISO();
+  const tsCompact = timestamp.replace(/[-:]/g, "").replace(/\.\d+/, "").replace("T", "T");
+
+  // When NAS is offline, buffer the entire message to WAL for later replay
+  if (!isNasOnline()) {
+    const seq = 0;
+    const msg = {
+      message_id: messageId,
+      seq,
+      timestamp,
+      channel_id: channelId,
+      from: cfg.agentId,
+      type: msgType,
+      content: { text, mentions, attachments: [] },
+      reply_to: replyTo ?? null,
+      metadata: { priority: "normal", ...(metadata ?? {}) },
+    };
+    const staged = path.join(stagedDir(cfg), "messages", `${messageId}.json`);
+    ensureDir(path.dirname(staged));
+    fs.writeFileSync(staged, JSON.stringify(msg, null, 2), "utf-8");
+    appendWal(cfg, {
+      op: "MESSAGE_SEND",
+      localPath: staged,
+      nasPath: `chatroom://channels/${channelId}/messages/${messageId}.json`,
+      metadata: { channel_id: channelId, mentions },
+    });
+    return { message_id: messageId, seq };
+  }
+
   const root = chatroomRoot(cfg);
   const chDir = path.join(root, "channels", channelId);
   const msgDir = path.join(chDir, "messages");
@@ -834,9 +1404,6 @@ function sendMessageToNAS(
   try {
     const meta = readJson(metaPath) ?? { last_message_seq: 0, message_count: 0 };
     const seq = (meta.last_message_seq ?? 0) + 1;
-    const messageId = randomUUID();
-    const timestamp = nowISO();
-    const tsCompact = timestamp.replace(/[-:]/g, "").replace(/\.\d+/, "").replace("T", "T");
 
     const msg = {
       message_id: messageId,
@@ -1329,8 +1896,15 @@ function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
               task_id: notif.retry_for_task,
               priority: "urgent",
               output_dir: taskData.asset_paths?.[0]
-                ? path.dirname(taskData.asset_paths[0])
-                : taskAssetsDir(cfg, cfg.agentId, notif.retry_for_task),
+                ? toChatroomUri(
+                    path.dirname(
+                      isChatroomUri(taskData.asset_paths[0])
+                        ? fromChatroomUri(taskData.asset_paths[0], cfg)
+                        : fromNasRelativePath(cfg, taskData.asset_paths[0]),
+                    ),
+                    cfg,
+                  )
+                : toChatroomUri(taskAssetsDir(cfg, cfg.agentId, notif.retry_for_task), cfg),
               is_retry: true,
             },
           });
@@ -1379,7 +1953,12 @@ function createTaskRecord(
   to: string,
   channelId: string,
   instruction: string,
-  opts?: { ackTimeoutMs?: number; taskTimeoutMs?: number; maxRetries?: number },
+  opts?: {
+    ackTimeoutMs?: number;
+    taskTimeoutMs?: number;
+    maxRetries?: number;
+    resumeStrategy?: ResumeStrategy;
+  },
 ): TaskRecord {
   const dir = tasksDir(cfg);
   ensureDir(dir);
@@ -1401,6 +1980,7 @@ function createTaskRecord(
     max_retries: opts?.maxRetries ?? 3,
     ack_timeout_ms: opts?.ackTimeoutMs ?? 60_000,
     task_timeout_ms: opts?.taskTimeoutMs ?? 3_600_000,
+    resume_strategy: getResumeStrategy(to, opts?.resumeStrategy),
   };
 
   writeJson(path.join(dir, `${task.task_id}.json`), task);
@@ -1413,6 +1993,21 @@ function readTaskRecord(cfg: ChatroomConfig, taskId: string): TaskRecord | null 
 
 function updateTaskRecord(cfg: ChatroomConfig, taskId: string, patch: Partial<TaskRecord>): void {
   const filePath = path.join(tasksDir(cfg), `${taskId}.json`);
+
+  if (!isNasOnline()) {
+    const staged = stagedPathFor(cfg, toChatroomUri(filePath, cfg));
+    ensureDir(path.dirname(staged));
+    // Write patch so Sync Manager can apply it later
+    fs.writeFileSync(staged, JSON.stringify(patch, null, 2), "utf-8");
+    appendWal(cfg, {
+      op: "TASK_UPDATE",
+      localPath: staged,
+      nasPath: toChatroomUri(filePath, cfg),
+      metadata: { task_id: taskId },
+    });
+    return;
+  }
+
   const existing = readJson(filePath);
   if (!existing) return;
   writeJson(filePath, { ...existing, ...patch });
@@ -1452,6 +2047,18 @@ function validateMessageIdentity(cfg: ChatroomConfig, msg: InboxMessage, logger:
   return true;
 }
 
+const AGENT_DEFAULT_RESUME_STRATEGY: Record<string, ResumeStrategy> = {
+  art: "continue",
+  audio: "continue",
+  git: "wait_and_check",
+  ux: "continue",
+};
+
+function getResumeStrategy(agentId: string, explicit?: ResumeStrategy): ResumeStrategy {
+  if (explicit) return explicit;
+  return AGENT_DEFAULT_RESUME_STRATEGY[agentId] ?? "restart";
+}
+
 function dispatchTask(
   cfg: ChatroomConfig,
   to: string,
@@ -1463,6 +2070,7 @@ function dispatchTask(
     maxRetries?: number;
     longRunning?: boolean;
     humanApprovalRequired?: boolean;
+    resumeStrategy?: ResumeStrategy;
   },
 ): TaskRecord {
   const channelId = `dm_${to}`;
@@ -1470,6 +2078,7 @@ function dispatchTask(
 
   const outputDir = taskAssetsDir(cfg, to, task.task_id);
   ensureDir(outputDir);
+  const outputDirUri = toChatroomUri(outputDir, cfg);
 
   const identityToken = randomUUID();
   const sessionNonce = randomUUID();
@@ -1477,7 +2086,7 @@ function dispatchTask(
   sendMessageToNAS(cfg, channelId, instruction, "TASK_DISPATCH", [to], undefined, {
     task_id: task.task_id,
     priority: "urgent",
-    output_dir: outputDir,
+    output_dir: outputDirUri,
     task_timeout_ms: task.task_timeout_ms,
     long_running: opts?.longRunning ?? false,
     from_agent_id: cfg.agentId,
@@ -1485,6 +2094,7 @@ function dispatchTask(
     agent_identity_token: identityToken,
     session_nonce: sessionNonce,
     human_approval_required: opts?.humanApprovalRequired ?? false,
+    resume_strategy: task.resume_strategy,
   });
 
   updateTaskRecord(cfg, task.task_id, {
@@ -1535,28 +2145,40 @@ function sendTaskResult(
     logger.warn(`Cannot send result — task ${taskId} not found`);
     return;
   }
-  const relativeAssetPaths = assetPaths.map((p) => toNasRelativePath(cfg, p));
-  sendMessageToNAS(cfg, task.channel_id, resultText, "RESULT_REPORT", [task.from], undefined, {
+  const uriAssetPaths = assetPaths.map((p) => toChatroomUri(p, cfg));
+
+  // Workers send DELIVERED (not DONE). Only the orchestrator can close a task after review.
+  const reportStatus = status === "DONE" ? "DELIVERED" : status;
+
+  // Append file listing to result text so it's always visible
+  let enrichedText = resultText;
+  if (uriAssetPaths.length > 0) {
+    enrichedText +=
+      `\n\n📂 Output files (${uriAssetPaths.length}):\n` +
+      uriAssetPaths.map((p) => `  • ${p}`).join("\n");
+  }
+
+  sendMessageToNAS(cfg, task.channel_id, enrichedText, "RESULT_REPORT", [task.from], undefined, {
     task_id: taskId,
-    status,
-    asset_paths: relativeAssetPaths,
+    status: reportStatus,
+    asset_paths: uriAssetPaths,
     error_type: errorType ?? undefined,
   });
   const patch: Partial<TaskRecord> = {
-    status,
-    completed_at: nowISO(),
-    result_summary: resultText.slice(0, 500),
-    asset_paths: relativeAssetPaths,
+    status: reportStatus as TaskStatus,
+    completed_at: status === "FAILED" ? nowISO() : null,
+    result_summary: enrichedText.slice(0, 500),
+    asset_paths: uriAssetPaths,
   };
   if (errorType) {
     patch.error_type = errorType;
     patch.error_detail = resultText.slice(0, 2000);
   }
-  patch.current_phase = status === "DONE" ? "completed" : "failed";
+  patch.current_phase = status === "FAILED" ? "failed" : "delivered";
   updateTaskRecord(cfg, taskId, patch);
   resetAgentStatus(cfg, task.to, logger);
   logger.info(
-    `Result sent for task ${taskId} (${status}${errorType ? ` [${errorType}]` : ""}) → ${task.from}`,
+    `Result DELIVERED for task ${taskId} (${reportStatus}${errorType ? ` [${errorType}]` : ""}) → ${task.from}`,
   );
 }
 
@@ -1967,7 +2589,7 @@ function monitorParkedTasks(cfg: ChatroomConfig, runtime: any, config: any, logg
         type: "TASK_DISPATCH",
         metadata: {
           task_id: info.task_id,
-          output_dir: taskAssetsDir(cfg, info.agent_id, info.task_id),
+          output_dir: toChatroomUri(taskAssetsDir(cfg, info.agent_id, info.task_id), cfg),
         },
         seq: 0,
       };
@@ -2084,6 +2706,24 @@ function handleIncomingTask(
   const currentTask = readTaskRecord(cfg, taskId)!;
   // Echo identity token in ACK for orchestrator verification
   sendSystemAck(cfg, currentTask, logger, identityToken, sessionNonce);
+
+  // Clean up the task output directory to avoid stale files from previous runs
+  const taskOutputDir = taskAssetsDir(cfg, cfg.agentId, taskId);
+  if (fs.existsSync(taskOutputDir)) {
+    const oldFiles = fs.readdirSync(taskOutputDir);
+    if (oldFiles.length > 0) {
+      logger.info(
+        `Cleaning ${oldFiles.length} stale file(s) from ${toChatroomUri(taskOutputDir, cfg)}`,
+      );
+      for (const f of oldFiles) {
+        try {
+          fs.unlinkSync(path.join(taskOutputDir, f));
+        } catch {
+          /* skip */
+        }
+      }
+    }
+  }
 
   updateTaskRecord(cfg, taskId, {
     status: "PROCESSING",
@@ -2247,28 +2887,33 @@ function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger
   const task = readTaskRecord(cfg, taskId);
   if (!task) return;
 
-  const resultStatus = (msg.metadata?.status as TaskStatus) || "DONE";
+  const reportStatus = (msg.metadata?.status as TaskStatus) || "DELIVERED";
+  const assetPaths = (msg.metadata?.asset_paths as string[]) ?? [];
+
+  // Task stays DELIVERED until orchestrator explicitly closes it
   const patch: Partial<TaskRecord> = {
-    status: resultStatus,
-    completed_at: nowISO(),
+    status: reportStatus === "FAILED" ? "FAILED" : "DELIVERED",
     result_summary: msg.content.text.slice(0, 500),
-    asset_paths: msg.metadata?.asset_paths ?? [],
+    asset_paths: assetPaths,
   };
+  if (reportStatus === "FAILED") {
+    patch.completed_at = nowISO();
+  }
   if (msg.metadata?.error_type) {
     patch.error_type = msg.metadata.error_type as TaskErrorType;
     patch.error_detail = msg.content.text.slice(0, 2000);
   }
-  patch.current_phase = resultStatus === "DONE" ? "completed" : "failed";
+  patch.current_phase = reportStatus === "FAILED" ? "failed" : "delivered";
   updateTaskRecord(cfg, taskId, patch);
   logger.info(
-    `Task ${taskId} result received from ${msg.from} (${resultStatus}${patch.error_type ? ` [${patch.error_type}]` : ""})`,
+    `Task ${taskId} result DELIVERED from ${msg.from} (${reportStatus}${patch.error_type ? ` [${patch.error_type}]` : ""}) — awaiting orchestrator review`,
   );
 
   // Send RESULT_ACK to confirm receipt (completes the result handshake)
   sendMessageToNAS(
     cfg,
     task.channel_id,
-    `[SYSTEM] Result for task ${taskId} received and verified.`,
+    `[SYSTEM] Result for task ${taskId} received. Awaiting orchestrator review.`,
     "RESULT_ACK",
     [msg.from],
     undefined,
@@ -2281,23 +2926,24 @@ function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger
   );
   logger.info(`RESULT_ACK sent for task ${taskId} → ${msg.from}`);
 
-  // Orchestrator: broadcast completion summary to #general so humans can see it
+  // Orchestrator: notify #general that result was delivered (not yet closed)
   if (cfg.role === "orchestrator") {
-    const assetPaths = (msg.metadata?.asset_paths as string[] | undefined) ?? [];
     const assetNote =
       assetPaths.length > 0
-        ? `\n\nOutput files (${assetPaths.length}):\n${assetPaths.map((p) => `- \`${toNasRelativePath(cfg, p)}\``).join("\n")}`
+        ? `\n\n📂 Output files (${assetPaths.length}):\n${assetPaths.map((p) => `- \`${p}\``).join("\n")}`
         : "";
-    const statusEmoji = resultStatus === "DONE" ? "✅" : "❌";
+    const statusEmoji = reportStatus === "FAILED" ? "❌" : "📋";
+    const statusLabel =
+      reportStatus === "FAILED" ? "Task failed" : "Task result delivered — reviewing";
     const summary =
-      `${statusEmoji} **Task completed** by **${msg.from}** (task \`${taskId.slice(0, 8)}\`)\n\n` +
+      `${statusEmoji} **${statusLabel}** from **${msg.from}** (task \`${taskId.slice(0, 8)}\`)\n\n` +
       `${msg.content.text.slice(0, 800)}${msg.content.text.length > 800 ? "..." : ""}` +
       assetNote;
     sendMessageToNAS(cfg, "general", summary, "CHAT", [], undefined, {
       task_id: taskId,
-      asset_paths: assetPaths.map((p) => toNasRelativePath(cfg, p)),
+      asset_paths: assetPaths,
     });
-    logger.info(`Task completion summary posted to #general for task ${taskId}`);
+    logger.info(`Task delivery notification posted to #general for task ${taskId}`);
   }
 }
 
@@ -2619,12 +3265,12 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
     ``,
     `═══ File System (NAS) ═══`,
-    `  All asset paths are stored as NAS-ROOT RELATIVE paths for cross-machine compatibility.`,
-    `  Your output dir: ${toNasRelativePath(cfg, myAssets)}`,
-    `  Shared dir: ${toNasRelativePath(cfg, sharedAssets)}`,
-    `  All agent assets: ${toNasRelativePath(cfg, assetsDir(cfg))}`,
+    `  All asset paths use the chatroom:// URI protocol for cross-machine compatibility.`,
+    `  Your output dir: ${toChatroomUri(myAssets, cfg)}`,
+    `  Shared dir: ${toChatroomUri(sharedAssets, cfg)}`,
+    `  All agent assets: ${toChatroomUri(assetsDir(cfg), cfg)}`,
     `  When dispatching a task, the system auto-creates an output dir for the target.`,
-    `  Agents on different machines may have different NAS mount points — relative paths ensure portability.`,
+    `  URI format: chatroom://assets/{agentId}/{taskId}/{file} — resolved against each machine's NAS mount.`,
     ``,
   ];
 
@@ -2647,10 +3293,22 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   lines.push(`    2. Agent → You: TASK_ACK (echoes identity token for verification)`);
   lines.push(`    3. You → Agent: DISPATCH_CONFIRMED (handshake complete)`);
   lines.push(`  Result delivery also uses confirmation:`);
-  lines.push(`    4. Agent → You: RESULT_REPORT`);
+  lines.push(`    4. Agent → You: RESULT_REPORT (status=DELIVERED — task NOT yet closed)`);
   lines.push(`    5. You → Agent: RESULT_ACK (receipt confirmed)`);
   lines.push(`  All messages carry from_agent_id and to_agent_id for strict identity validation.`);
   lines.push(`  Output files are placed in: ${assetsDir(cfg)}/{agent_id}/{task_id}/`);
+  lines.push(``);
+  lines.push(`═══ CRITICAL: Task Review & Close Protocol ═══`);
+  lines.push(`  When you receive a RESULT_REPORT, the task status becomes DELIVERED (NOT DONE).`);
+  lines.push(`  You MUST review the deliverables before closing:`);
+  lines.push(`    1. Read the RESULT_REPORT and check the file list`);
+  lines.push(`    2. Verify output files exist using chatroom_list_assets`);
+  lines.push(`    3. Use chatroom_close_task(task_id, verdict="accepted") to mark DONE`);
+  lines.push(
+    `       OR chatroom_close_task(task_id, verdict="rejected", comment="reason") for rework`,
+  );
+  lines.push(`  NEVER leave a task in DELIVERED state — always close or reject promptly.`);
+  lines.push(`  The agent worker CANNOT close its own task. Only you (orchestrator) can.`);
   lines.push(``);
   lines.push(
     `  Example: chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`,
@@ -2772,9 +3430,9 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  Otherwise your session will pause until an admin decides.`,
     ``,
     `═══ File System (NAS) ═══`,
-    `  All asset paths are stored as NAS-ROOT RELATIVE paths for cross-machine compatibility.`,
-    `  Your output dir: ${toNasRelativePath(cfg, myAssets)}`,
-    `  To access files from other agents, resolve their relative path with your own NAS root.`,
+    `  All asset paths use the chatroom:// URI protocol for cross-machine compatibility.`,
+    `  Your output dir: ${toChatroomUri(myAssets, cfg)}`,
+    `  To access files from other agents, resolve their chatroom:// URI with your own NAS root.`,
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
     ``,
     `═══ RAG (Project Knowledge) ═══`,
@@ -2791,6 +3449,15 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `    chatroom_save_asset(filename="report.md", content="...", task_id="...")`,
     `  IMPORTANT: For binary files, ALWAYS use chatroom_publish_file/publish_and_send.`,
     `  These perform direct binary copy with MD5 verification — never use base64 for local files.`,
+    ``,
+    `═══ Task Result & Delivery ═══`,
+    `  When you finish a task, your result status will be DELIVERED (not DONE).`,
+    `  The orchestrator will review your output and then accept or reject it.`,
+    `  If rejected, you will receive a rework request with feedback.`,
+    `  Your result message MUST clearly state:`,
+    `    1. What you produced (summary)`,
+    `    2. The output file paths will be automatically appended`,
+    `  Do NOT mark your own tasks as DONE — only the orchestrator can do that.`,
     ``,
   ];
 
@@ -2840,7 +3507,25 @@ async function autoDispatchMessage(
     : msg.from;
 
   const chatroomContext = buildChatroomContext(chatroomCfg, channelId);
-  const messageBody = `[Chatroom #${channelId}] ${senderLabel}: ${msg.content.text}`;
+
+  // If this is a RESULT_REPORT to the orchestrator, add a review prompt
+  let messageBody: string;
+  if (msg.type === "RESULT_REPORT" && chatroomCfg.role === "orchestrator") {
+    const taskId = msg.metadata?.task_id as string | undefined;
+    const assetPaths = (msg.metadata?.asset_paths as string[] | undefined) ?? [];
+    const assetSection =
+      assetPaths.length > 0
+        ? `\nDelivered files:\n${assetPaths.map((p) => `  • ${p}`).join("\n")}`
+        : "\n(No files delivered)";
+    messageBody =
+      `[RESULT_REPORT from ${senderLabel}] Task ${taskId ?? "unknown"}${assetSection}\n\n` +
+      `${msg.content.text}\n\n` +
+      `⚠️ ACTION REQUIRED: Review the deliverables above. ` +
+      `Use chatroom_list_assets to verify files exist, then call chatroom_close_task(task_id="${taskId}", verdict="accepted") ` +
+      `to close, or verdict="rejected" with a comment to request rework.`;
+  } else {
+    messageBody = `[Chatroom #${channelId}] ${senderLabel}: ${msg.content.text}`;
+  }
   const bodyForAgent = chatroomContext ? `${chatroomContext}\n${messageBody}` : messageBody;
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -3117,9 +3802,11 @@ async function stepExecutionLoop(
     current_step: 0,
   } as Partial<TaskRecord>);
 
-  const outputDir =
-    msg.metadata?.output_dir ?? taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
-  ensureDir(outputDir as string);
+  const rawOutputDir = msg.metadata?.output_dir as string | undefined;
+  const outputDir = rawOutputDir
+    ? fromChatroomUri(rawOutputDir, chatroomCfg)
+    : taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
+  ensureDir(outputDir);
 
   const previousResults: { title: string; result: string }[] = [];
 
@@ -3429,9 +4116,11 @@ async function autoDispatchForTask(
     peer: { kind: isDM ? "direct" : "group", id: channelId },
   });
 
-  const outputDir =
-    msg.metadata?.output_dir ?? taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
-  ensureDir(outputDir as string);
+  const rawOutputDir2 = msg.metadata?.output_dir as string | undefined;
+  const outputDir = rawOutputDir2
+    ? fromChatroomUri(rawOutputDir2, chatroomCfg)
+    : taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
+  ensureDir(outputDir);
 
   const taskContext = [
     `[CHATROOM TASK — STRICT PROTOCOL]`,
@@ -3689,6 +4378,15 @@ const agentChatroomPlugin = {
                   "The agent will be advised to use chatroom_task_park for waiting periods.",
               }),
             ),
+            resume_strategy: Type.Optional(
+              Type.String({
+                description:
+                  "How to handle this task if NAS goes offline mid-execution. " +
+                  "'continue' = keep going, sync later; 'restart' = redo from scratch; " +
+                  "'wait_and_check' = check external process status first. " +
+                  "Defaults based on target agent (art/audio=continue, git=wait_and_check, else=restart).",
+              }),
+            ),
           }),
           async execute(_toolCallId, params) {
             try {
@@ -3697,6 +4395,7 @@ const agentChatroomPlugin = {
                 instruction: string;
                 timeout_minutes?: number;
                 long_running?: boolean;
+                resume_strategy?: ResumeStrategy;
               };
               const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
               let instruction = p.instruction;
@@ -3710,6 +4409,7 @@ const agentChatroomPlugin = {
               const task = dispatchTask(cfg, p.target, instruction, logger, {
                 taskTimeoutMs: timeoutMs,
                 longRunning: p.long_running,
+                resumeStrategy: p.resume_strategy,
               });
               return {
                 content: [
@@ -3721,6 +4421,7 @@ const agentChatroomPlugin = {
                       `  channel: #${task.channel_id}\n` +
                       `  timeout: ${p.timeout_minutes ?? 60} minutes\n` +
                       `  long_running: ${p.long_running ?? false}\n` +
+                      `  resume_strategy: ${task.resume_strategy}\n` +
                       `  status: DISPATCHED (awaiting ACK)\n` +
                       `The system will auto-retry if ${p.target} doesn't respond.`,
                   },
@@ -3737,6 +4438,130 @@ const agentChatroomPlugin = {
         },
         { names: ["chatroom_dispatch_task"] },
       );
+
+      // ── Tool: close/accept task (orchestrator only) ─────────────────────────
+
+      if (cfg.role === "orchestrator") {
+        api.registerTool(
+          {
+            name: "chatroom_close_task",
+            label: "Chatroom: Close Task",
+            description:
+              "Close a DELIVERED task after reviewing the agent's output.\n" +
+              "Only the orchestrator can close tasks. Call this after verifying the output files are correct.\n" +
+              "Use verdict='accepted' if the deliverables are satisfactory, or 'rejected' to send back for rework.",
+            parameters: Type.Object({
+              task_id: Type.String({ description: "Task ID to close" }),
+              verdict: Type.Union([Type.Literal("accepted"), Type.Literal("rejected")], {
+                description: "'accepted' to mark DONE, 'rejected' to request rework",
+              }),
+              comment: Type.Optional(
+                Type.String({ description: "Review comment (required if rejected)" }),
+              ),
+            }),
+            async execute(_toolCallId, params) {
+              try {
+                const p = params as {
+                  task_id: string;
+                  verdict: "accepted" | "rejected";
+                  comment?: string;
+                };
+                const task = readTaskRecord(cfg, p.task_id);
+                if (!task) {
+                  return {
+                    content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
+                    details: undefined,
+                  };
+                }
+                if (task.status !== "DELIVERED") {
+                  return {
+                    content: [
+                      {
+                        type: "text" as const,
+                        text: `Task ${p.task_id} is not in DELIVERED state (current: ${task.status}). Only DELIVERED tasks can be closed.`,
+                      },
+                    ],
+                    details: undefined,
+                  };
+                }
+
+                if (p.verdict === "accepted") {
+                  updateTaskRecord(cfg, p.task_id, {
+                    status: "DONE",
+                    completed_at: nowISO(),
+                    current_phase: "completed",
+                  });
+                  const note = p.comment ? `\n\nReview: ${p.comment}` : "";
+                  sendMessageToNAS(
+                    cfg,
+                    "general",
+                    `✅ **Task closed** — \`${p.task_id.slice(0, 8)}\` by **${task.to}** accepted.${note}`,
+                    "CHAT",
+                    [],
+                    undefined,
+                    { task_id: p.task_id },
+                  );
+                  sendMessageToNAS(
+                    cfg,
+                    task.channel_id,
+                    `[SYSTEM] Task ${p.task_id} has been reviewed and accepted by the orchestrator.${note}`,
+                    "STATUS_UPDATE",
+                    [task.to],
+                    undefined,
+                    { task_id: p.task_id, status: "DONE" },
+                  );
+                  logger.info(`Task ${p.task_id} ACCEPTED and closed`);
+                  return {
+                    content: [
+                      {
+                        type: "text" as const,
+                        text: `Task ${p.task_id} accepted and closed. Agent ${task.to} notified.`,
+                      },
+                    ],
+                    details: { task_id: p.task_id, status: "DONE" },
+                  };
+                } else {
+                  updateTaskRecord(cfg, p.task_id, {
+                    status: "PROCESSING",
+                    current_phase: "rework",
+                  });
+                  const reason = p.comment || "Output did not meet requirements.";
+                  sendMessageToNAS(
+                    cfg,
+                    task.channel_id,
+                    `[REVIEW] Task ${p.task_id} result rejected — rework needed.\n\nReason: ${reason}`,
+                    "TASK_DISPATCH",
+                    [task.to],
+                    undefined,
+                    {
+                      task_id: p.task_id,
+                      status: "PROCESSING",
+                      rework: true,
+                      rework_reason: reason,
+                    },
+                  );
+                  logger.info(`Task ${p.task_id} REJECTED — sent back to ${task.to} for rework`);
+                  return {
+                    content: [
+                      {
+                        type: "text" as const,
+                        text: `Task ${p.task_id} rejected and sent back to ${task.to} for rework. Reason: ${reason}`,
+                      },
+                    ],
+                    details: { task_id: p.task_id, status: "PROCESSING" },
+                  };
+                }
+              } catch (err) {
+                return {
+                  content: [{ type: "text" as const, text: `Error closing task: ${err}` }],
+                  details: undefined,
+                };
+              }
+            },
+          },
+          { names: ["chatroom_close_task"] },
+        );
+      }
 
       // ── Tool: check task status ─────────────────────────────────────────────
 
@@ -4186,29 +5011,28 @@ const agentChatroomPlugin = {
             // Guard: detect if content is actually a file path
             const detectedPath = detectMisusedFilePath(p.content);
             if (detectedPath) {
-              const result = publishFileToNAS(detectedPath, dir, p.filename);
-              const relPath = toNasRelativePath(cfg, result.nasPath);
+              const result = publishFileToNAS(detectedPath, dir, p.filename, cfg);
+              const uri = toChatroomUri(result.nasPath, cfg);
               return {
                 content: [
                   {
                     type: "text" as const,
                     text:
                       `[AUTO-CORRECTED] Detected file path in content — copied file directly instead.\n` +
-                      `File published to NAS (verified): ${relPath} (${formatFileSize(result.sourceSize)}, MD5: ${result.md5})\n` +
+                      `File published to NAS (verified): ${uri} (${formatFileSize(result.sourceSize)}, MD5: ${result.md5})\n` +
                       `TIP: Next time, use chatroom_publish_file(source_path="${detectedPath}") for binary files.`,
                   },
                 ],
-                details: { ...result, nasPath: relPath },
+                details: { ...result, nasPath: uri },
               };
             }
 
-            ensureDir(dir);
             const filePath = toForwardSlash(path.join(dir, p.filename));
 
             if (p.encoding === "base64") {
               const buf = Buffer.from(p.content, "base64");
-              fs.writeFileSync(filePath, buf);
-              const relPath = toNasRelativePath(cfg, filePath);
+              nasWriteFile(cfg, filePath, buf);
+              const uri = toChatroomUri(filePath, cfg);
               const ext = path.extname(p.filename).toLowerCase();
               const sizeNote =
                 buf.length > 512 * 1024
@@ -4221,23 +5045,23 @@ const agentChatroomPlugin = {
                 content: [
                   {
                     type: "text" as const,
-                    text: `File saved: ${relPath} (${formatFileSize(buf.length)})${sizeNote}${binNote}`,
+                    text: `File saved: ${uri} (${formatFileSize(buf.length)})${sizeNote}${binNote}`,
                   },
                 ],
-                details: { path: relPath, size: buf.length },
+                details: { path: uri, size: buf.length },
               };
             }
 
-            fs.writeFileSync(filePath, p.content, "utf-8");
-            const relPath = toNasRelativePath(cfg, filePath);
+            nasWriteFile(cfg, filePath, p.content);
+            const uri = toChatroomUri(filePath, cfg);
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `File saved: ${relPath} (${fs.statSync(filePath).size} bytes)`,
+                  text: `File saved: ${uri} (${fs.statSync(filePath).size} bytes)`,
                 },
               ],
-              details: { path: relPath, size: fs.statSync(filePath).size },
+              details: { path: uri, size: fs.statSync(filePath).size },
             };
           } catch (err) {
             return {
@@ -4401,8 +5225,8 @@ const agentChatroomPlugin = {
             // Guard: detect if content is actually a file path
             const detectedPath = detectMisusedFilePath(p.content);
             if (detectedPath) {
-              const pubResult = publishFileToNAS(detectedPath, dir, p.filename);
-              const relPath = toNasRelativePath(cfg, pubResult.nasPath);
+              const pubResult = publishFileToNAS(detectedPath, dir, p.filename, cfg);
+              const pubUri = toChatroomUri(pubResult.nasPath, cfg);
               const displayName = p.filename ?? path.basename(detectedPath);
               const msgText = p.text ?? `📎 ${displayName}`;
               const sendResult = sendMessageToNAS(
@@ -4413,7 +5237,7 @@ const agentChatroomPlugin = {
                 [],
                 undefined,
                 {
-                  asset_paths: [relPath],
+                  asset_paths: [pubUri],
                 },
               );
               return {
@@ -4423,7 +5247,7 @@ const agentChatroomPlugin = {
                     text:
                       `[AUTO-CORRECTED] Detected file path in content — copied file directly.\n` +
                       `File published and sent to #${p.channel_id} (seq: ${sendResult.seq}, verified):\n` +
-                      `  NAS path: ${pubResult.nasPath} (${formatFileSize(pubResult.sourceSize)}, MD5: ${pubResult.md5})\n` +
+                      `  URI: ${pubUri} (${formatFileSize(pubResult.sourceSize)}, MD5: ${pubResult.md5})\n` +
                       `TIP: Next time, use chatroom_publish_and_send(source_path="${detectedPath}") for binary files.`,
                   },
                 ],
@@ -4431,20 +5255,22 @@ const agentChatroomPlugin = {
               };
             }
 
-            ensureDir(dir);
             const filePath = toForwardSlash(path.join(dir, p.filename));
 
             if (p.encoding === "base64") {
-              fs.writeFileSync(filePath, Buffer.from(p.content, "base64"));
+              nasWriteFile(cfg, filePath, Buffer.from(p.content, "base64"));
             } else {
-              fs.writeFileSync(filePath, p.content, "utf-8");
+              nasWriteFile(cfg, filePath, p.content);
             }
 
-            const fileSize = fs.statSync(filePath).size;
-            const relPath = toNasRelativePath(cfg, filePath);
+            const fileSize = Buffer.byteLength(
+              p.content,
+              p.encoding === "base64" ? "base64" : "utf-8",
+            );
+            const fileUri = toChatroomUri(filePath, cfg);
             const msgText = p.text ?? `📎 ${p.filename}`;
             const result = sendMessageToNAS(cfg, p.channel_id, msgText, "CHAT", [], undefined, {
-              asset_paths: [relPath],
+              asset_paths: [fileUri],
             });
 
             return {
@@ -4453,7 +5279,7 @@ const agentChatroomPlugin = {
                   type: "text" as const,
                   text:
                     `File uploaded and message sent to #${p.channel_id} (seq: ${result.seq})\n` +
-                    `  Path: ${relPath} (${fileSize} bytes)`,
+                    `  URI: ${fileUri} (${fileSize} bytes)`,
                 },
               ],
               details: { path: filePath, size: fileSize, seq: result.seq },
@@ -4509,8 +5335,8 @@ const agentChatroomPlugin = {
             const dir = p.task_id
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
-            const result = publishFileToNAS(p.source_path, dir, p.filename);
-            const relPath = toNasRelativePath(cfg, result.nasPath);
+            const result = publishFileToNAS(p.source_path, dir, p.filename, cfg);
+            const uri = toChatroomUri(result.nasPath, cfg);
             return {
               content: [
                 {
@@ -4518,12 +5344,12 @@ const agentChatroomPlugin = {
                   text:
                     `File published to NAS (verified):\n` +
                     `  Source: ${p.source_path}\n` +
-                    `  NAS path (relative): ${relPath}\n` +
+                    `  URI: ${uri}\n` +
                     `  Size: ${formatFileSize(result.sourceSize)}\n` +
                     `  MD5: ${result.md5}`,
                 },
               ],
-              details: { ...result, nasPath: relPath },
+              details: { ...result, nasPath: uri },
             };
           } catch (err) {
             return {
@@ -4601,13 +5427,13 @@ const agentChatroomPlugin = {
             const dir = p.task_id
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
-            const result = publishFileToNAS(p.source_path, dir, p.filename);
-            const relPath = toNasRelativePath(cfg, result.nasPath);
+            const result = publishFileToNAS(p.source_path, dir, p.filename, cfg);
+            const uri = toChatroomUri(result.nasPath, cfg);
 
             const displayName = p.filename ?? path.basename(p.source_path);
             const msgText = p.text ?? `📎 ${displayName}`;
             const sendResult = sendMessageToNAS(cfg, p.channel_id, msgText, "CHAT", [], undefined, {
-              asset_paths: [relPath],
+              asset_paths: [uri],
             });
 
             return {
@@ -4616,7 +5442,7 @@ const agentChatroomPlugin = {
                   type: "text" as const,
                   text:
                     `File published and message sent to #${p.channel_id} (seq: ${sendResult.seq}, verified):\n` +
-                    `  NAS path: ${relPath}\n` +
+                    `  URI: ${uri}\n` +
                     `  Size: ${formatFileSize(result.sourceSize)} | MD5: ${result.md5}`,
                 },
               ],
@@ -4672,16 +5498,16 @@ const agentChatroomPlugin = {
               targetDir = p.task_id ? taskAssetsDir(cfg, scope, p.task_id) : assetsDir(cfg, scope);
             }
 
-            const relDir = toNasRelativePath(cfg, targetDir);
+            const dirUri = toChatroomUri(targetDir, cfg);
             if (!fs.existsSync(targetDir)) {
               return {
                 content: [
                   {
                     type: "text" as const,
-                    text: `Directory does not exist: ${relDir}`,
+                    text: `Directory does not exist: ${dirUri}`,
                   },
                 ],
-                details: { files: [], dir: relDir },
+                details: { files: [], dir: dirUri },
               };
             }
 
@@ -4695,7 +5521,7 @@ const agentChatroomPlugin = {
                 const stat = fs.statSync(fullPath);
                 files.push({
                   name: entry.name,
-                  path: toNasRelativePath(cfg, fullPath),
+                  path: toChatroomUri(fullPath, cfg),
                   size: formatFileSize(stat.size),
                   type: path.extname(entry.name).toLowerCase() || "(no ext)",
                 });
@@ -4704,7 +5530,7 @@ const agentChatroomPlugin = {
               }
             }
 
-            const lines: string[] = [`Directory: ${relDir}`];
+            const lines: string[] = [`Directory: ${dirUri}`];
             if (dirs.length > 0) {
               lines.push(`Subdirectories: ${dirs.join(", ")}`);
             }
@@ -4719,7 +5545,7 @@ const agentChatroomPlugin = {
 
             return {
               content: [{ type: "text" as const, text: lines.join("\n") }],
-              details: { dir: relDir, files, dirs },
+              details: { dir: dirUri, files, dirs },
             };
           } catch (err) {
             return {
@@ -5435,6 +6261,44 @@ const agentChatroomPlugin = {
           `Chatroom daemon starting for agent=${agentId}, role=${cfg.role.toUpperCase()} (task protocol enabled)`,
         );
 
+        // Start NAS health monitor and register sync + task-resume callbacks
+        startNasHealthMonitor(cfg, logger);
+        onNasStateChange((state, prev) => {
+          if (state === "OFFLINE" && prev !== "OFFLINE") {
+            // Mark active tasks as NAS-offline buffering
+            try {
+              const activeTasks = listTasksByStatus(cfg, "PROCESSING", "ACKED");
+              for (const t of activeTasks) {
+                if (t.to === cfg.agentId || t.from === cfg.agentId) {
+                  updateTaskRecord(cfg, t.task_id, { current_phase: "nas_offline_buffering" });
+                  appendTaskProgress(cfg, t.task_id, {
+                    phase: "nas_offline_buffering",
+                    detail: `NAS went offline. Strategy: ${t.resume_strategy ?? "restart"}`,
+                  });
+                }
+              }
+            } catch {
+              /* updateTaskRecord already buffers locally */
+            }
+          }
+
+          if (state === "ONLINE" && prev !== "ONLINE") {
+            logger.info(`[sync] NAS back online — triggering WAL sync`);
+            try {
+              syncWalEntries(cfg, logger);
+            } catch (err) {
+              logger.error(`[sync] WAL sync failed: ${err}`);
+            }
+
+            // Apply resume strategies for tasks that were buffering
+            try {
+              applyResumeStrategies(cfg, logger);
+            } catch (err) {
+              logger.error(`[resume] Failed to apply resume strategies: ${err}`);
+            }
+          }
+        });
+
         try {
           updateHeartbeat(cfg);
         } catch (err) {
@@ -5647,6 +6511,7 @@ const agentChatroomPlugin = {
         }, parkMonitorIntervalMs);
       },
       stop: async () => {
+        stopNasHealthMonitor();
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (pollTimer) clearInterval(pollTimer);
         if (taskMonitorTimer) clearInterval(taskMonitorTimer);
