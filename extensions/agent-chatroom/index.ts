@@ -3724,11 +3724,49 @@ async function autoDispatchMessage(
     agentId: route.agentId,
   });
 
+  // Write thinking state so the frontend can show a live "Thinking..." indicator
+  const thinkingFile = path.join(
+    chatroomCfg.nasRoot,
+    "chatroom",
+    "thinking",
+    `${chatroomCfg.agentId}.json`,
+  );
+  const updateThinking = (state: "thinking" | "tool" | "done", snippet?: string) => {
+    try {
+      ensureDir(path.dirname(thinkingFile));
+      writeJson(thinkingFile, {
+        agent_id: chatroomCfg.agentId,
+        channel_id: channelId,
+        message_id: msg.message_id,
+        state,
+        snippet: snippet?.slice(0, 500) ?? "",
+        updated_at: nowISO(),
+      });
+    } catch {
+      /* best effort */
+    }
+  };
+  updateThinking("thinking");
+
   const dispatcherOptions = {
     responsePrefix: prefixContext.responsePrefix,
     responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
-    deliver: async (payload: ReplyPayload) => {
+    deliver: async (payload: ReplyPayload, info?: { kind: string }) => {
       const text = payload.text ?? "";
+      const kind = info?.kind ?? "final";
+
+      if (kind === "block") {
+        updateThinking("thinking", text);
+        return;
+      }
+      if (kind === "tool") {
+        const toolName = (payload as any).toolName ?? "tool";
+        updateThinking("tool", `Using ${toolName}...`);
+        return;
+      }
+
+      // kind === "final"
+      updateThinking("done");
       if (!text.trim()) return;
       try {
         const inlineMentions = parseAtMentions(text);
@@ -3739,6 +3777,7 @@ async function autoDispatchMessage(
       }
     },
     onError: (err: any, info: any) => {
+      updateThinking("done");
       logger.error(`Dispatch error (${info?.kind}): ${err}`);
     },
   };
@@ -4092,8 +4131,16 @@ async function stepExecutionLoop(
       }
     }
   }
-  const allFiles =
+  const rawFiles =
     taggedDeliverables.length > 0 ? taggedDeliverables : scanOutputDir(outputDir as string);
+  // Deduplicate by basename — multiple steps may declare the same output file
+  const seenNames = new Set<string>();
+  const allFiles = rawFiles.filter((f) => {
+    const base = path.basename(f).toLowerCase();
+    if (seenNames.has(base)) return false;
+    seenNames.add(base);
+    return true;
+  });
 
   const resultSummary = [
     `Plan completed: ${plan.summary}`,
