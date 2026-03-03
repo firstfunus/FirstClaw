@@ -36,7 +36,12 @@
     "chatroomServerUrl": {
       "label": "Chatroom Server URL",
       "placeholder": "http://192.168.1.100:8080",
-      "help": "URL of the Chatroom web server. Used for RAG queries and other API calls."
+      "help": "URL of the Chatroom web server. Used for other API calls."
+    },
+    "ragServiceUrl": {
+      "label": "RAG Service URL",
+      "placeholder": "http://192.168.1.100:8000",
+      "help": "URL of the rag_graphrag service. Overridden by RAG_SERVICE_URL env var. Defaults to http://localhost:8000."
     }
   },
   "configSchema": {
@@ -64,6 +69,9 @@
         "type": "string"
       },
       "chatroomServerUrl": {
+        "type": "string"
+      },
+      "ragServiceUrl": {
         "type": "string"
       }
     },

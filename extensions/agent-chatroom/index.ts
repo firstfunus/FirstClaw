@@ -38,6 +38,7 @@ interface ChatroomConfig {
   role: "orchestrator" | "worker";
   repoRoot: string | null;
   chatroomServerUrl?: string;
+  ragServiceUrl?: string;
 }
 
 interface AgentRegistryEntry {
@@ -3572,6 +3573,7 @@ const agentChatroomPlugin = {
       role,
       localDir: (pluginCfg.localDir as string) ?? "./chatroom_local",
       repoRoot: (pluginCfg.repoRoot as string) ?? null,
+      ragServiceUrl: (pluginCfg.ragServiceUrl as string) ?? undefined,
     };
     ensureDir(cfg.localDir);
     ensureDir(tasksDir(cfg));
@@ -3994,6 +3996,24 @@ const agentChatroomPlugin = {
 
     // ── Tool: RAG query (retrieval augmented generation) ──────────────────
 
+    /**
+     * Resolve the best Chatroom channel for RAG usage reports.
+     * Priority: current task's channel → dm_<agentId> (worker) → general (orchestrator).
+     */
+    function resolveReportChannel(): string {
+      try {
+        const regPath = path.join(chatroomRoot(cfg), "registry", `${cfg.agentId}.json`);
+        const info = readJson(regPath);
+        if (info?.current_task) {
+          const task = readTaskRecord(cfg, info.current_task);
+          if (task?.channel_id) return task.channel_id;
+        }
+      } catch {
+        // fall through to defaults
+      }
+      return cfg.role === "orchestrator" ? "general" : `dm_${cfg.agentId}`;
+    }
+
     api.registerTool(
       {
         name: "rag_query",
@@ -4012,72 +4032,115 @@ const agentChatroomPlugin = {
           ),
         }),
         async execute(_toolCallId, params) {
-          try {
-            const p = params as { query: string; max_results?: number };
-            const chatroomServerUrl =
-              process.env.CHATROOM_SERVER_URL || cfg.chatroomServerUrl || "http://localhost:8080";
-            const url = `${chatroomServerUrl}/api/rag/query`;
+          const p = params as { query: string; max_results?: number };
+          const ragServiceUrl =
+            process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
+          const url = `${ragServiceUrl}/query`;
+          const reportChannel = resolveReportChannel();
 
+          // ── [RAG][QUERY] report ──
+          try {
+            sendMessageToNAS(
+              cfg,
+              reportChannel,
+              `[RAG][QUERY] ${p.query}`,
+              "STATUS_UPDATE",
+            );
+          } catch (e) {
+            logger.warn(`RAG report (QUERY) failed: ${e}`);
+          }
+
+          try {
             const response = await fetch(url, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 query: p.query,
-                max_results: p.max_results ?? 5,
+                top_k: p.max_results ?? 5,
               }),
             });
 
             if (!response.ok) {
               const errText = await response.text();
+              const errMsg = `RAG query failed (${response.status}): ${errText}`;
+
+              // ── [RAG][ERROR] report ──
+              try {
+                sendMessageToNAS(
+                  cfg,
+                  reportChannel,
+                  `[RAG][ERROR] strategy: unavailable | ${errMsg}`,
+                  "STATUS_UPDATE",
+                );
+              } catch (e) {
+                logger.warn(`RAG report (ERROR) failed: ${e}`);
+              }
+
               return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: `RAG query failed (${response.status}): ${errText}`,
-                  },
-                ],
+                content: [{ type: "text" as const, text: errMsg }],
                 details: undefined,
               };
             }
 
-            const data = await response.json();
-            const results = data.results ?? [];
-            if (results.length === 0) {
-              return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: `No RAG results found for: "${p.query}"`,
-                  },
-                ],
-                details: data,
-              };
+            const data = (await response.json()) as {
+              answer: string;
+              sources: { text: string; source: string; score: number }[];
+              strategy: string;
+              latency_ms: number;
+            };
+
+            const sources = data.sources ?? [];
+
+            // Build readable output
+            let text = `RAG query: "${p.query}"\nStrategy: ${data.strategy || "unknown"} | Latency: ${Math.round(data.latency_ms)}ms\n\n`;
+            text += `Answer:\n${data.answer}\n`;
+
+            if (sources.length > 0) {
+              text += `\nSources (${sources.length}):\n`;
+              text += sources
+                .map(
+                  (s, i) =>
+                    `[${i + 1}] ${s.source || "unknown"} (score: ${s.score.toFixed(3)})\n${s.text}`,
+                )
+                .join("\n\n---\n\n");
             }
 
-            const formatted = results
-              .map(
-                (r: any, i: number) =>
-                  `[${i + 1}] ${r.title ?? r.source ?? "Result"}\n${r.content ?? r.text ?? JSON.stringify(r)}`,
-              )
-              .join("\n\n---\n\n");
+            // ── [RAG][RESPONSE] report (includes strategy) ──
+            const sourceSummary = sources.length > 0
+              ? sources.map((s, i) => `[${i + 1}] ${s.source || "unknown"}`).join(", ")
+              : "none";
+            try {
+              sendMessageToNAS(
+                cfg,
+                reportChannel,
+                `[RAG][RESPONSE] strategy: ${data.strategy || "unknown"} | sources: ${sourceSummary}\n${data.answer}`,
+                "STATUS_UPDATE",
+              );
+            } catch (e) {
+              logger.warn(`RAG report (RESPONSE) failed: ${e}`);
+            }
 
             return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `RAG query: "${p.query}"\n${results.length} results:\n\n${formatted}`,
-                },
-              ],
+              content: [{ type: "text" as const, text }],
               details: data,
             };
           } catch (err) {
+            const errMsg = `RAG query error: ${err}. The RAG service may not be running.`;
+
+            // ── [RAG][ERROR] report ──
+            try {
+              sendMessageToNAS(
+                cfg,
+                reportChannel,
+                `[RAG][ERROR] strategy: unavailable | ${errMsg}`,
+                "STATUS_UPDATE",
+              );
+            } catch (e) {
+              logger.warn(`RAG report (ERROR) failed: ${e}`);
+            }
+
             return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `RAG query error: ${err}. The RAG service may not be running.`,
-                },
-              ],
+              content: [{ type: "text" as const, text: errMsg }],
               details: undefined,
             };
           }
