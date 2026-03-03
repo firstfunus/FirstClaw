@@ -32,6 +32,11 @@
       "label": "FirstClaw Repo Root",
       "placeholder": "/Users/me/openclaw",
       "help": "Absolute path to the local FirstClaw git repository. Required for /system-update to work."
+    },
+    "chatroomServerUrl": {
+      "label": "Chatroom Server URL",
+      "placeholder": "http://192.168.1.100:8080",
+      "help": "URL of the Chatroom web server. Used for RAG queries and other API calls."
     }
   },
   "configSchema": {
@@ -56,6 +61,9 @@
         "type": "number"
       },
       "repoRoot": {
+        "type": "string"
+      },
+      "chatroomServerUrl": {
         "type": "string"
       }
     },

@@ -1,5 +1,5 @@
 /**
- * Agent Chatroom Plugin for FirstClaw / OpenClaw
+ * Agent Chatroom Plugin for the Firstclaw framework (OpenClaw)
  *
  * Provides:
  *   1. Tools for LLM agents to interact with the multi-agent chatroom.
@@ -37,6 +37,7 @@ interface ChatroomConfig {
   localDir: string;
   role: "orchestrator" | "worker";
   repoRoot: string | null;
+  chatroomServerUrl?: string;
 }
 
 interface AgentRegistryEntry {
@@ -143,7 +144,7 @@ interface PlanStep {
 }
 
 interface PlanApproval {
-  mode: "orchestrator" | "human";
+  mode: "orchestrator" | "human" | "autonomous";
   approved_by: string | null;
   decision: "pending" | "approved" | "rejected" | "revision_requested" | null;
   decision_reason: string | null;
@@ -1404,8 +1405,24 @@ function listTasksByStatus(cfg: ChatroomConfig, ...statuses: TaskStatus[]): Task
 }
 
 // ============================================================================
-// Task Protocol: dispatch, ACK, result
+// Task Protocol: dispatch, ACK, result (TCP-style reliable handshake)
 // ============================================================================
+
+/**
+ * Validates that a message's identity fields match the expected recipient.
+ * Returns true if valid, false if the message should be rejected.
+ */
+function validateMessageIdentity(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): boolean {
+  const meta = msg.metadata ?? {};
+  const toAgent = meta.to_agent_id;
+  if (toAgent && toAgent !== cfg.agentId) {
+    logger.warn(
+      `[identity] Rejecting message ${msg.message_id}: to_agent_id="${toAgent}" does not match self="${cfg.agentId}"`,
+    );
+    return false;
+  }
+  return true;
+}
 
 function dispatchTask(
   cfg: ChatroomConfig,
@@ -1417,6 +1434,7 @@ function dispatchTask(
     taskTimeoutMs?: number;
     maxRetries?: number;
     longRunning?: boolean;
+    humanApprovalRequired?: boolean;
   },
 ): TaskRecord {
   const channelId = `dm_${to}`;
@@ -1425,25 +1443,52 @@ function dispatchTask(
   const outputDir = taskAssetsDir(cfg, to, task.task_id);
   ensureDir(outputDir);
 
+  const identityToken = randomUUID();
+  const sessionNonce = randomUUID();
+
   sendMessageToNAS(cfg, channelId, instruction, "TASK_DISPATCH", [to], undefined, {
     task_id: task.task_id,
     priority: "urgent",
     output_dir: outputDir,
     task_timeout_ms: task.task_timeout_ms,
     long_running: opts?.longRunning ?? false,
+    from_agent_id: cfg.agentId,
+    to_agent_id: to,
+    agent_identity_token: identityToken,
+    session_nonce: sessionNonce,
+    human_approval_required: opts?.humanApprovalRequired ?? false,
   });
 
-  logger.info(`Task ${task.task_id} dispatched to ${to} via #${channelId} (output: ${outputDir})`);
+  updateTaskRecord(cfg, task.task_id, {
+    identity_token: identityToken,
+    session_nonce: sessionNonce,
+  } as any);
+
+  logger.info(
+    `Task ${task.task_id} dispatched to ${to} via #${channelId} (token: ${identityToken.slice(0, 8)}...)`,
+  );
   return task;
 }
 
-function sendSystemAck(cfg: ChatroomConfig, task: TaskRecord, logger: Logger): void {
+function sendSystemAck(
+  cfg: ChatroomConfig,
+  task: TaskRecord,
+  logger: Logger,
+  identityToken?: string,
+  sessionNonce?: string,
+): void {
   const ackText = `[SYSTEM] Task ${task.task_id} acknowledged by ${cfg.agentId}`;
   sendMessageToNAS(cfg, task.channel_id, ackText, "TASK_ACK", [task.from], undefined, {
     task_id: task.task_id,
+    from_agent_id: cfg.agentId,
+    to_agent_id: task.from,
+    agent_identity_token: identityToken,
+    session_nonce: sessionNonce,
   });
   updateTaskRecord(cfg, task.task_id, { status: "ACKED", acked_at: nowISO() });
-  logger.info(`ACK sent for task ${task.task_id} → ${task.from}`);
+  logger.info(
+    `ACK sent for task ${task.task_id} → ${task.from} (token echo: ${identityToken?.slice(0, 8) ?? "none"})`,
+  );
 }
 
 function sendTaskResult(
@@ -1970,6 +2015,15 @@ function handleIncomingTask(
     return;
   }
 
+  // TCP-style identity validation: verify this task is meant for us
+  if (!validateMessageIdentity(cfg, msg, logger)) {
+    logger.warn(`[handshake] Rejecting TASK_DISPATCH ${taskId}: identity mismatch`);
+    return;
+  }
+
+  const identityToken = msg.metadata?.agent_identity_token as string | undefined;
+  const sessionNonce = msg.metadata?.session_nonce as string | undefined;
+
   const task = readTaskRecord(cfg, taskId);
   if (!task) {
     logger.warn(`Task ${taskId} not found on NAS, creating local record`);
@@ -1999,7 +2053,8 @@ function handleIncomingTask(
   }
 
   const currentTask = readTaskRecord(cfg, taskId)!;
-  sendSystemAck(cfg, currentTask, logger);
+  // Echo identity token in ACK for orchestrator verification
+  sendSystemAck(cfg, currentTask, logger, identityToken, sessionNonce);
 
   updateTaskRecord(cfg, taskId, {
     status: "PROCESSING",
@@ -2007,6 +2062,7 @@ function handleIncomingTask(
     current_phase: "processing",
     error_type: null,
     error_detail: null,
+    human_approval_required: Boolean(msg.metadata?.human_approval_required),
   } as Partial<TaskRecord>);
   setAgentWorking(cfg, cfg.agentId, taskId, logger);
   logger.info(`Processing task ${taskId} from ${msg.from}: "${msg.content.text.slice(0, 80)}..."`);
@@ -2027,7 +2083,9 @@ function handleIncomingTask(
 }
 
 /**
- * Plan Mode: planning phase -> approval -> step-by-step execution.
+ * Plan Mode: planning phase -> autonomous execution (no orchestrator approval).
+ * If human_approval_required flag is set (from /human command), wait for human approval.
+ * Otherwise, the agent executes its plan autonomously.
  */
 async function handlePlanModeTask(
   cfg: ChatroomConfig,
@@ -2046,22 +2104,57 @@ async function handlePlanModeTask(
       return;
     }
 
-    // Phase 1.5: Approval
-    logger.info(`Task ${taskId}: waiting for plan approval (mode: ${plan.approval.mode})`);
-    const approvedPlan = await waitForApproval(cfg, plan, taskId, logger);
-    if (!approvedPlan) {
-      logger.warn(`Plan for task ${taskId} was not approved — approval returned null`);
-      const existingTask = readTaskRecord(cfg, taskId);
-      if (existingTask && existingTask.status !== "CANCELLED" && existingTask.status !== "FAILED") {
-        sendTaskResult(cfg, taskId, "Plan was rejected or approval timed out", "FAILED", logger);
+    // Check if human approval is required (from /human command)
+    const task = readTaskRecord(cfg, taskId);
+    const needsHumanApproval = Boolean(
+      (task as any)?.human_approval_required || msg.metadata?.human_approval_required,
+    );
+
+    let approvedPlan: TaskPlan | null;
+
+    if (needsHumanApproval) {
+      // /human mode: wait for human approval via dashboard
+      logger.info(`Task ${taskId}: /human mode — waiting for human approval`);
+      plan.approval.mode = "human";
+      approvedPlan = await waitForApproval(cfg, plan, taskId, logger);
+      if (!approvedPlan) {
+        logger.warn(`Plan for task ${taskId} was not approved by human`);
+        const existingTask = readTaskRecord(cfg, taskId);
+        if (
+          existingTask &&
+          existingTask.status !== "CANCELLED" &&
+          existingTask.status !== "FAILED"
+        ) {
+          sendTaskResult(
+            cfg,
+            taskId,
+            "Plan was rejected or human approval timed out",
+            "FAILED",
+            logger,
+          );
+        }
+        return;
       }
-      return;
+    } else {
+      // Autonomous mode: auto-approve and execute immediately
+      logger.info(`Task ${taskId}: autonomous plan mode — auto-approving`);
+      approvedPlan = updatePlan(cfg, taskId, {
+        status: "APPROVED",
+        approved_at: nowISO(),
+        approval: {
+          ...plan.approval,
+          mode: "autonomous",
+          approved_by: cfg.agentId,
+          decision: "approved",
+          decision_reason: "Agent autonomous execution (no orchestrator approval needed)",
+          decided_at: nowISO(),
+        },
+      });
+      if (!approvedPlan) approvedPlan = plan;
     }
 
     // Phase 2: Step-by-step execution
-    logger.info(
-      `Task ${taskId}: plan approved, starting step execution (${approvedPlan.steps.length} steps)`,
-    );
+    logger.info(`Task ${taskId}: starting step execution (${approvedPlan.steps.length} steps)`);
     await stepExecutionLoop(cfg, approvedPlan, msg, taskId, runtime, config, logger);
   } catch (err) {
     logger.error(`Plan mode error for task ${taskId}: ${err}`);
@@ -2077,18 +2170,50 @@ function handleTaskAck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): 
   if (!task) return;
 
   if (task.status === "DISPATCHED" || task.status === "TIMEOUT" || task.status === "RETRYING") {
+    // TCP-style: verify echoed identity token from the worker
+    const echoedToken = msg.metadata?.agent_identity_token as string | undefined;
+    const storedToken = (task as any).identity_token as string | undefined;
+    if (storedToken && echoedToken && storedToken !== echoedToken) {
+      logger.warn(
+        `[handshake] Task ${taskId}: ACK token mismatch (expected=${storedToken.slice(0, 8)}, got=${echoedToken.slice(0, 8)}). Possible identity confusion.`,
+      );
+      return;
+    }
+
     updateTaskRecord(cfg, taskId, {
       status: "ACKED",
       acked_at: nowISO(),
       current_phase: "acked",
     } as Partial<TaskRecord>);
-    logger.info(`Task ${taskId} ACK received from ${msg.from}`);
+    logger.info(`Task ${taskId} ACK received from ${msg.from} (token verified)`);
+
+    // Send DISPATCH_CONFIRMED to complete the three-way handshake
+    sendMessageToNAS(
+      cfg,
+      task.channel_id,
+      `[SYSTEM] Task ${taskId} confirmed — handshake complete. Proceed with execution.`,
+      "DISPATCH_CONFIRMED",
+      [task.to],
+      undefined,
+      {
+        task_id: taskId,
+        from_agent_id: cfg.agentId,
+        to_agent_id: task.to,
+        session_nonce: (task as any).session_nonce,
+      },
+    );
+    logger.info(`DISPATCH_CONFIRMED sent for task ${taskId} → ${task.to}`);
   }
 }
 
 function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
   const taskId = msg.metadata?.task_id;
   if (!taskId) return;
+
+  if (!validateMessageIdentity(cfg, msg, logger)) {
+    logger.warn(`[handshake] Rejecting RESULT_REPORT for task ${taskId}: identity mismatch`);
+    return;
+  }
 
   const task = readTaskRecord(cfg, taskId);
   if (!task) return;
@@ -2109,6 +2234,135 @@ function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger
   logger.info(
     `Task ${taskId} result received from ${msg.from} (${resultStatus}${patch.error_type ? ` [${patch.error_type}]` : ""})`,
   );
+
+  // Send RESULT_ACK to confirm receipt (completes the result handshake)
+  sendMessageToNAS(
+    cfg,
+    task.channel_id,
+    `[SYSTEM] Result for task ${taskId} received and verified.`,
+    "RESULT_ACK",
+    [msg.from],
+    undefined,
+    {
+      task_id: taskId,
+      from_agent_id: cfg.agentId,
+      to_agent_id: msg.from,
+      verified: true,
+    },
+  );
+  logger.info(`RESULT_ACK sent for task ${taskId} → ${msg.from}`);
+}
+
+// ============================================================================
+// Plan Question/Answer routing (point-to-point via Orchestrator)
+// ============================================================================
+
+async function handlePlanQuestion(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<void> {
+  const sourceTaskId = msg.metadata?.task_id as string | undefined;
+  const question = (msg.metadata?.question as string) || msg.content.text;
+  const sourceAgent = msg.from;
+
+  logger.info(
+    `[question] Received PLAN_QUESTION from ${sourceAgent} (task ${sourceTaskId}): "${question.slice(0, 80)}"`,
+  );
+
+  const agents = readAgentRegistry(cfg);
+  const otherAgents = agents.filter(
+    (a) => a.agent_id !== cfg.agentId && a.agent_id !== sourceAgent,
+  );
+  if (otherAgents.length === 0) {
+    sendMessageToNAS(
+      cfg,
+      `dm_${sourceAgent}`,
+      `No other agents available to answer this question. Please proceed with your best judgment.`,
+      "ANSWER_FORWARD",
+      [sourceAgent],
+      undefined,
+      { task_id: sourceTaskId, source_agent_id: sourceAgent, source_task_id: sourceTaskId },
+    );
+    return;
+  }
+
+  // Use LLM to decide which agent should answer
+  const agentList = otherAgents.map((a) => `- ${a.agent_id} (${a.display_name})`).join("\n");
+  const routingPrompt = [
+    `An agent "${sourceAgent}" has a question about their task:`,
+    `Question: ${question}`,
+    ``,
+    `Available agents to route this question to:`,
+    agentList,
+    ``,
+    `Which agent is best suited to answer? Reply with just the agent_id.`,
+    `If no agent can answer, reply with "none".`,
+  ].join("\n");
+
+  // Forward to the first available agent as a simple heuristic,
+  // or use LLM routing via auto-dispatch
+  const targetAgent = otherAgents[0].agent_id;
+  const targetDM = `dm_${targetAgent}`;
+
+  sendMessageToNAS(
+    cfg,
+    targetDM,
+    `[QUESTION from ${sourceAgent}] ${question}`,
+    "QUESTION_FORWARD",
+    [targetAgent],
+    undefined,
+    {
+      task_id: sourceTaskId,
+      source_agent_id: sourceAgent,
+      source_task_id: sourceTaskId,
+      from_agent_id: cfg.agentId,
+      to_agent_id: targetAgent,
+      question,
+    },
+  );
+  logger.info(`[question] Forwarded question to ${targetAgent}`);
+}
+
+async function handleQuestionForward(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<void> {
+  const question = (msg.metadata?.question as string) || msg.content.text;
+  const sourceAgent = msg.metadata?.source_agent_id as string;
+  const sourceTaskId = msg.metadata?.source_task_id as string;
+
+  logger.info(
+    `[question] Received QUESTION_FORWARD from orchestrator (originally from ${sourceAgent}): "${question.slice(0, 80)}"`,
+  );
+
+  // Auto-dispatch to LLM for answering
+  await autoDispatchMessage(cfg, msg, runtime, config, logger);
+}
+
+function handleQuestionAnswer(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
+  const sourceAgent = msg.metadata?.source_agent_id as string;
+  const sourceTaskId = msg.metadata?.source_task_id as string;
+
+  if (!sourceAgent) {
+    logger.warn(`[question] QUESTION_ANSWER without source_agent_id, ignoring`);
+    return;
+  }
+
+  const targetDM = `dm_${sourceAgent}`;
+  sendMessageToNAS(cfg, targetDM, msg.content.text, "ANSWER_FORWARD", [sourceAgent], undefined, {
+    task_id: sourceTaskId,
+    source_agent_id: msg.from,
+    source_task_id: sourceTaskId,
+    from_agent_id: cfg.agentId,
+    to_agent_id: sourceAgent,
+  });
+  logger.info(`[question] Answer from ${msg.from} forwarded to ${sourceAgent}`);
 }
 
 // ============================================================================
@@ -2296,23 +2550,22 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   const sharedAssets = assetsDir(cfg, "shared");
 
   const lines: string[] = [
-    `[Chatroom Orchestration Context]`,
-    `You are "${cfg.agentId}", the Orchestrator of the First Agent Family.`,
+    `[Chatroom Orchestration Context — Firstclaw Framework]`,
+    `You are "${cfg.agentId}" (FirstClaw), the Orchestrator of the First Agent Family.`,
+    `You run on the Firstclaw framework. Your role is to understand human tasks and dispatch them to specialist agents.`,
+    `All inter-agent communication is strictly point-to-point (you ↔ each agent). Agents do NOT communicate with each other.`,
     ``,
     `═══ CHANNEL RULES (MUST follow) ═══`,
     `  #general   → Human ↔ Orchestrator communication ONLY.`,
     `               When a human sends a message here, respond HERE and nowhere else.`,
     `               Do NOT post task results, progress updates, or agent replies to #general.`,
-    `  #pipeline  → Pipeline status updates and progress summaries.`,
-    `               Post stage progress (e.g. "Stage 1 complete, moving to Stage 2") here.`,
-    `               Post final delivery summaries here when a full pipeline completes.`,
     `  #permission → Sensitive operation approval channel (system-managed).`,
     `               When agents encounter sensitive operations, the system posts approval`,
     `               requests here automatically. Human admins approve/reject via Web UI.`,
     `               Do NOT manually send messages to #permission.`,
-    `  dm_{agent} → Private task channels between you and a specific agent.`,
-    `               Task dispatch and result delivery happen here automatically via the protocol.`,
-    `               Do NOT manually send messages to DM channels — the system handles it.`,
+    `  dm_{agent} → Private point-to-point channels between you and a specific agent.`,
+    `               ALL task dispatch, questions, answers, and result delivery happen here.`,
+    `               This is the primary communication mechanism. Each DM is a dedicated link to one agent.`,
     ``,
     `  CRITICAL: Your response goes to the SAME channel as the incoming message.`,
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
@@ -2337,14 +2590,25 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
     lines.push(``);
   }
 
-  lines.push(`═══ Task Dispatch Protocol ═══`);
+  lines.push(`═══ Task Dispatch Protocol (TCP-style reliable handshake) ═══`);
   lines.push(`  Use chatroom_dispatch_task to assign work to agents.`);
-  lines.push(`  The system handles: DM delivery → ACK → result collection.`);
+  lines.push(`  The system handles a three-way handshake for reliable delivery:`);
+  lines.push(`    1. You → Agent: TASK_DISPATCH (with identity token)`);
+  lines.push(`    2. Agent → You: TASK_ACK (echoes identity token for verification)`);
+  lines.push(`    3. You → Agent: DISPATCH_CONFIRMED (handshake complete)`);
+  lines.push(`  Result delivery also uses confirmation:`);
+  lines.push(`    4. Agent → You: RESULT_REPORT`);
+  lines.push(`    5. You → Agent: RESULT_ACK (receipt confirmed)`);
+  lines.push(`  All messages carry from_agent_id and to_agent_id for strict identity validation.`);
   lines.push(`  Output files are placed in: ${assetsDir(cfg)}/{agent_id}/{task_id}/`);
   lines.push(``);
   lines.push(
     `  Example: chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`,
   );
+  lines.push(``);
+  lines.push(`═══ RAG (Project Knowledge) ═══`);
+  lines.push(`  Use rag_query(query="...") to retrieve project context from the RAG system.`);
+  lines.push(`  Query RAG before making decisions that depend on project specs or history.`);
   lines.push(``);
   lines.push(`═══ File Sharing Protocol ═══`);
   lines.push(`  Binary files (images, audio, PDFs, models):`);
@@ -2359,10 +2623,16 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   lines.push(`  These perform direct binary copy with MD5 verification — no base64 needed.`);
   lines.push(``);
 
-  lines.push(`═══ Plan Mode ═══`);
-  lines.push(`  Agents create execution plans before starting complex tasks.`);
-  lines.push(`  Use chatroom_approve_plan to approve, reject, or request revision of plans.`);
-  lines.push(`  Use chatroom_list_plans to see all plans.`);
+  lines.push(`═══ Plan Mode (Autonomous) ═══`);
+  lines.push(
+    `  Agents create and execute their own plans autonomously — you do NOT approve or reject plans.`,
+  );
+  lines.push(`  If an agent has questions about its task, it will send a PLAN_QUESTION to you.`);
+  lines.push(`  You then route the question to the appropriate agent for an answer.`);
+  lines.push(`  Use chatroom_list_plans to monitor plan progress.`);
+  lines.push(
+    `  When a /human command is active, plans require human approval via the Web dashboard.`,
+  );
   lines.push(``);
 
   const activeTasks = listTasksByStatus(
@@ -2392,7 +2662,7 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
     lines.push(``);
   }
 
-  // Show pending plans that need orchestrator review
+  // Show plans awaiting human approval (only when /human command is active)
   try {
     const plDir = plansDir(cfg);
     if (fs.existsSync(plDir)) {
@@ -2400,25 +2670,15 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
       for (const f of fs.readdirSync(plDir)) {
         if (!f.endsWith(".json")) continue;
         const plan = readJson(path.join(plDir, f)) as TaskPlan | null;
-        if (
-          plan &&
-          (plan.status === "PENDING_REVIEW" || plan.status === "DRAFT") &&
-          plan.approval?.decision === "pending"
-        ) {
+        if (plan && plan.status === "PENDING_REVIEW" && plan.approval?.mode === "human") {
           pendingPlans.push(plan);
         }
       }
       if (pendingPlans.length > 0) {
-        lines.push(`═══ Plans Awaiting Review ═══`);
+        lines.push(`═══ Plans Awaiting Human Approval (/human mode) ═══`);
         for (const p of pendingPlans) {
           lines.push(`  - Task ${p.task_id.slice(0, 8)}... by ${p.agent_id}: "${p.summary}"`);
           lines.push(`    Steps: ${p.steps.length} (est. ${p.estimated_total_minutes}min)`);
-          for (const s of p.steps) {
-            lines.push(`      ${s.order}. ${s.title} (~${s.estimated_minutes}min)`);
-          }
-          lines.push(
-            `    → Use chatroom_approve_plan(task_id="${p.task_id}", decision="approved") to approve`,
-          );
         }
         lines.push(``);
       }
@@ -2435,8 +2695,8 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
   const myDM = `dm_${cfg.agentId}`;
 
   const lines: string[] = [
-    `[Agent Worker Context]`,
-    `You are "${cfg.agentId}", a specialist worker agent in the First Agent Family.`,
+    `[Agent Worker Context — Firstclaw Framework]`,
+    `You are "${cfg.agentId}", a specialist worker agent in the First Agent Family, running on the Firstclaw framework.`,
     ``,
     `═══ YOUR ROLE ═══`,
     `  You are NOT the orchestrator. You are a task executor.`,
@@ -2465,6 +2725,12 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  Your output dir: ${myAssets}`,
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
     ``,
+    `═══ RAG (Project Knowledge) ═══`,
+    `  BEFORE starting any task, query the RAG system for project context:`,
+    `    rag_query(query="relevant question about the project")`,
+    `  The RAG contains project documentation, design specs, and prior decisions.`,
+    `  Use it to understand requirements, constraints, and existing patterns.`,
+    ``,
     `═══ File Sharing Protocol ═══`,
     `  Binary files (images, audio, PDFs, models):`,
     `    chatroom_publish_file(source_path="/local/path/file.png", task_id="...")`,
@@ -2487,7 +2753,7 @@ function buildChatroomContext(cfg: ChatroomConfig, sourceChannel?: string): stri
 }
 
 // ============================================================================
-// Auto-dispatch: push messages through the LLM pipeline
+// Auto-dispatch: push messages through the LLM processing chain
 // ============================================================================
 
 async function autoDispatchMessage(
@@ -2712,8 +2978,8 @@ async function planningPhase(
 }
 
 /**
- * Wait for plan approval. In orchestrator mode, sends a review request
- * to the orchestrator. In human mode, waits for dashboard approval.
+ * Wait for human approval via the Web dashboard.
+ * Only used when /human command is active. No auto-approve timeout.
  * Returns the approved plan, or null if rejected/timed out.
  */
 async function waitForApproval(
@@ -2722,91 +2988,22 @@ async function waitForApproval(
   taskId: string,
   logger: Logger,
 ): Promise<TaskPlan | null> {
-  if (plan.approval.mode === "orchestrator") {
-    // Notify orchestrator about the plan
-    sendMessageToNAS(
-      cfg,
-      "general",
-      `[PLAN_REVIEW_REQUEST] Agent ${plan.agent_id} created a plan for task ${taskId}:\n` +
-        `Summary: ${plan.summary}\n` +
-        `Steps: ${plan.steps.length} (est. ${plan.estimated_total_minutes}min)\n` +
-        plan.steps.map((s) => `  ${s.order}. ${s.title} (~${s.estimated_minutes}min)`).join("\n") +
-        `\n\nUse chatroom_approve_plan to approve, reject, or request revision.`,
-      "SYSTEM",
-      ["firstclaw"],
-      undefined,
-      { task_id: taskId, plan_id: plan.plan_id },
-    );
+  // Notify via DM that this plan requires human approval
+  const dmChannel = `dm_${cfg.agentId}`;
+  sendMessageToNAS(
+    cfg,
+    dmChannel,
+    `[HUMAN_APPROVAL_REQUIRED] Plan for task ${taskId} requires human approval:\n` +
+      `Summary: ${plan.summary}\n` +
+      `Steps: ${plan.steps.length} (est. ${plan.estimated_total_minutes}min)\n` +
+      plan.steps.map((s) => `  ${s.order}. ${s.title} (~${s.estimated_minutes}min)`).join("\n") +
+      `\n\nPlease approve, reject, or request revision from the Web dashboard.`,
+    "SYSTEM",
+    [],
+    undefined,
+    { task_id: taskId, plan_id: plan.plan_id, human_approval_required: true },
+  );
 
-    updatePlan(cfg, taskId, { status: "PENDING_REVIEW" });
-    updateTaskRecord(cfg, taskId, { current_phase: "awaiting_plan_review" } as Partial<TaskRecord>);
-    logger.info(`Plan for task ${taskId} sent to orchestrator for review`);
-
-    // Poll for approval with a timeout (5 min for orchestrator mode)
-    const approvalTimeoutMs = 5 * 60_000;
-    const pollMs = 3_000;
-    const deadline = Date.now() + approvalTimeoutMs;
-    let consecutiveReadFailures = 0;
-
-    while (Date.now() < deadline) {
-      const current = readPlan(cfg, taskId);
-      if (!current) {
-        // NAS/SMB file read may transiently fail — retry instead of aborting
-        consecutiveReadFailures++;
-        if (consecutiveReadFailures > 10) {
-          logger.warn(
-            `Plan file for task ${taskId} unreadable after ${consecutiveReadFailures} attempts`,
-          );
-          return null;
-        }
-        logger.info(
-          `Plan read returned null for task ${taskId}, retrying (${consecutiveReadFailures})`,
-        );
-        await new Promise((r) => setTimeout(r, pollMs));
-        continue;
-      }
-      consecutiveReadFailures = 0;
-
-      if (current.status === "APPROVED") {
-        logger.info(`Plan for task ${taskId} approved by ${current.approval.approved_by}`);
-        return current;
-      }
-      if (current.status === "CANCELLED") {
-        logger.info(`Plan for task ${taskId} rejected`);
-        return null;
-      }
-      if (current.status === "DRAFT" && current.revision > plan.revision) {
-        logger.info(`Plan for task ${taskId} revision requested — would need re-planning`);
-        return null;
-      }
-
-      // Check if the task was cancelled externally
-      const task = readTaskRecord(cfg, taskId);
-      if (task?.status === "CANCELLED") {
-        updatePlan(cfg, taskId, { status: "CANCELLED", completed_at: nowISO() });
-        return null;
-      }
-
-      await new Promise((r) => setTimeout(r, pollMs));
-    }
-
-    // Auto-approve on timeout in orchestrator mode
-    logger.info(`Plan approval timed out for task ${taskId}, auto-approving`);
-    const approved = updatePlan(cfg, taskId, {
-      status: "APPROVED",
-      approved_at: nowISO(),
-      approval: {
-        ...plan.approval,
-        approved_by: "system:auto",
-        decision: "approved",
-        decision_reason: "Auto-approved after timeout",
-        decided_at: nowISO(),
-      },
-    });
-    return approved;
-  }
-
-  // Human mode: wait for dashboard approval (no auto-approve timeout)
   updatePlan(cfg, taskId, { status: "PENDING_REVIEW" });
   updateTaskRecord(cfg, taskId, {
     current_phase: "awaiting_human_approval",
@@ -3193,7 +3390,7 @@ async function autoDispatchForTask(
     `INSTRUCTION:`,
     msg.content.text,
     ``,
-    `RULES (MUST follow — violations break the pipeline):`,
+    `RULES (MUST follow — violations break the task protocol):`,
     `1. FILE SHARING PROTOCOL — choose the right tool:`,
     `   ┌─────────────────────────────────────────────────────────────────────────┐`,
     `   │ chatroom_publish_file    — PREFERRED for ALL local files (binary-safe) │`,
@@ -3618,161 +3815,51 @@ const agentChatroomPlugin = {
         { names: ["chatroom_cancel_task"] },
       );
 
-      // ── Tool: approve a task plan ─────────────────────────────────────────
+      // ── Tool: ask question (worker → orchestrator for routing) ────────────
 
       api.registerTool(
         {
-          name: "chatroom_approve_plan",
-          label: "Chatroom: Approve Task Plan",
+          name: "chatroom_ask_question",
+          label: "Chatroom: Ask Question",
           description:
-            "Approve (or reject) a worker agent's task plan.\n" +
-            "Once approved, the agent will begin step-by-step execution.\n" +
-            "You can also add comments to individual steps before approving.",
+            "Ask a question about your task. The question will be sent to the Orchestrator (FirstClaw),\n" +
+            "who will route it to the most appropriate agent for an answer.\n" +
+            "Use this when you need clarification about the task requirements or need information\n" +
+            "from another agent's domain.",
           parameters: Type.Object({
-            task_id: Type.String({ description: "Task ID whose plan to review" }),
-            decision: Type.Union(
-              [
-                Type.Literal("approved"),
-                Type.Literal("rejected"),
-                Type.Literal("revision_requested"),
-              ],
-              {
-                description: "Your decision: approve, reject, or request revision",
-              },
-            ),
-            reason: Type.Optional(Type.String({ description: "Reason for the decision" })),
-            step_comments: Type.Optional(
-              Type.Array(
-                Type.Object({
-                  step_order: Type.Number({ description: "Step order number (1-based)" }),
-                  comment: Type.String({ description: "Your comment or suggestion for this step" }),
-                  type: Type.Optional(
-                    Type.Union(
-                      [
-                        Type.Literal("suggestion"),
-                        Type.Literal("approval"),
-                        Type.Literal("warning"),
-                        Type.Literal("rejection"),
-                      ],
-                      { description: "Comment type (default: suggestion)" },
-                    ),
-                  ),
-                }),
-                { description: "Optional per-step comments" },
-              ),
+            task_id: Type.String({ description: "The task ID this question relates to" }),
+            question: Type.String({ description: "Your question" }),
+            context: Type.Optional(
+              Type.String({ description: "Additional context to help route the question" }),
             ),
           }),
           async execute(_toolCallId, params) {
             try {
-              const p = params as {
-                task_id: string;
-                decision: "approved" | "rejected" | "revision_requested";
-                reason?: string;
-                step_comments?: { step_order: number; comment: string; type?: string }[];
-              };
-              const plan = readPlan(cfg, p.task_id);
-              if (!plan) {
-                return {
-                  content: [
-                    { type: "text" as const, text: `Plan not found for task ${p.task_id}` },
-                  ],
-                  details: undefined,
-                };
-              }
-              if (p.step_comments) {
-                for (const sc of p.step_comments) {
-                  const step = plan.steps.find((s) => s.order === sc.step_order);
-                  if (step) {
-                    step.comments.push({
-                      comment_id: randomUUID(),
-                      step_id: step.step_id,
-                      from: cfg.agentId,
-                      text: sc.comment,
-                      timestamp: nowISO(),
-                      type: (sc.type as StepComment["type"]) ?? "suggestion",
-                    });
-                  }
-                }
-              }
-              plan.approval.approved_by = cfg.agentId;
-              plan.approval.decision = p.decision;
-              plan.approval.decision_reason = p.reason ?? null;
-              plan.approval.decided_at = nowISO();
-              if (p.decision === "approved") {
-                plan.status = "APPROVED";
-                plan.approved_at = nowISO();
-              } else if (p.decision === "rejected") {
-                plan.status = "CANCELLED";
-                plan.completed_at = nowISO();
-              } else {
-                plan.status = "DRAFT";
-                plan.revision += 1;
-              }
-              writePlan(cfg, plan);
-              if (p.decision === "rejected") {
-                updateTaskRecord(cfg, p.task_id, {
-                  status: "FAILED",
-                  completed_at: nowISO(),
-                  current_phase: "plan_rejected",
-                  error_detail: `Plan rejected: ${p.reason ?? "no reason"}`,
-                } as Partial<TaskRecord>);
-              }
-
-              // Send approval decision to DM channel
-              const approvalTask = readTaskRecord(cfg, p.task_id);
-              if (approvalTask) {
-                const decisionEmoji =
-                  p.decision === "approved" ? "✅" : p.decision === "rejected" ? "❌" : "🔄";
-                const decisionLabel =
-                  p.decision === "approved"
-                    ? "Plan Approved"
-                    : p.decision === "rejected"
-                      ? "Plan Rejected"
-                      : "Revision Requested";
-                const msgType =
-                  p.decision === "approved"
-                    ? "PLAN_APPROVED"
-                    : p.decision === "rejected"
-                      ? "PLAN_REJECTED"
-                      : "PLAN_REVISION";
-                let approvalMsgText = `${decisionEmoji} **${decisionLabel}** — ${plan.summary}`;
-                if (p.reason) approvalMsgText += `\n\nReason: ${p.reason}`;
-                if (p.step_comments?.length) {
-                  approvalMsgText += `\n\nStep comments (${p.step_comments.length}):`;
-                  for (const sc of p.step_comments) {
-                    approvalMsgText += `\n  Step ${sc.step_order}: ${sc.comment}`;
-                  }
-                }
-                sendMessageToNAS(
-                  cfg,
-                  approvalTask.channel_id,
-                  approvalMsgText,
-                  msgType,
-                  [approvalTask.to],
-                  undefined,
-                  {
-                    task_id: p.task_id,
-                    plan_id: plan.plan_id,
-                    decision: p.decision,
-                    reason: p.reason ?? null,
-                  },
-                );
-              }
-
+              const p = params as { task_id: string; question: string; context?: string };
+              const orchestratorDM = `dm_${cfg.agentId}`;
+              sendMessageToNAS(
+                cfg,
+                orchestratorDM,
+                `[PLAN_QUESTION] ${p.question}${p.context ? `\n\nContext: ${p.context}` : ""}`,
+                "PLAN_QUESTION",
+                ["firstclaw"],
+                undefined,
+                {
+                  task_id: p.task_id,
+                  from_agent_id: cfg.agentId,
+                  to_agent_id: "firstclaw",
+                  question: p.question,
+                  question_context: p.context,
+                },
+              );
               return {
                 content: [
                   {
                     type: "text" as const,
-                    text:
-                      `Plan ${p.decision} for task ${p.task_id}.\n` +
-                      (p.reason ? `  reason: ${p.reason}\n` : "") +
-                      (p.step_comments?.length
-                        ? `  step_comments: ${p.step_comments.length}\n`
-                        : "") +
-                      `  plan_status: ${plan.status}`,
+                    text: `Question sent to Orchestrator for routing. You will receive an answer via ANSWER_FORWARD message.`,
                   },
                 ],
-                details: { plan_status: plan.status, decision: p.decision },
+                details: { task_id: p.task_id, question: p.question },
               };
             } catch (err) {
               return {
@@ -3782,7 +3869,63 @@ const agentChatroomPlugin = {
             }
           },
         },
-        { names: ["chatroom_approve_plan"] },
+        { names: ["chatroom_ask_question"] },
+      );
+
+      // ── Tool: answer a forwarded question ───────────────────────────────────
+
+      api.registerTool(
+        {
+          name: "chatroom_answer_question",
+          label: "Chatroom: Answer Question",
+          description:
+            "Answer a question that was forwarded to you by the Orchestrator.\n" +
+            "Your answer will be routed back to the agent who asked.",
+          parameters: Type.Object({
+            source_task_id: Type.String({ description: "The task ID the question relates to" }),
+            source_agent_id: Type.String({ description: "The agent who asked the question" }),
+            answer: Type.String({ description: "Your answer" }),
+          }),
+          async execute(_toolCallId, params) {
+            try {
+              const p = params as {
+                source_task_id: string;
+                source_agent_id: string;
+                answer: string;
+              };
+              const orchestratorDM = `dm_${cfg.agentId}`;
+              sendMessageToNAS(
+                cfg,
+                orchestratorDM,
+                p.answer,
+                "QUESTION_ANSWER",
+                ["firstclaw"],
+                undefined,
+                {
+                  source_task_id: p.source_task_id,
+                  source_agent_id: p.source_agent_id,
+                  from_agent_id: cfg.agentId,
+                  to_agent_id: "firstclaw",
+                },
+              );
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Answer sent to Orchestrator for forwarding to ${p.source_agent_id}.`,
+                  },
+                ],
+                details: { source_agent_id: p.source_agent_id },
+              };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: `Error: ${err}` }],
+                details: undefined,
+              };
+            }
+          },
+        },
+        { names: ["chatroom_answer_question"] },
       );
 
       // ── Tool: list plans ──────────────────────────────────────────────────
@@ -3848,6 +3991,100 @@ const agentChatroomPlugin = {
     } // end orchestrator-only tools
 
     // ── Shared tools (available to ALL agents) ────────────────────────────
+
+    // ── Tool: RAG query (retrieval augmented generation) ──────────────────
+
+    api.registerTool(
+      {
+        name: "rag_query",
+        label: "RAG: Query Project Knowledge",
+        description:
+          "Query the project RAG (Retrieval Augmented Generation) system to retrieve relevant project context.\n" +
+          "IMPORTANT: You SHOULD call this tool before starting any task to understand the project context.\n" +
+          "The RAG contains project documentation, design specs, codebase knowledge, and prior decisions.",
+        parameters: Type.Object({
+          query: Type.String({
+            description:
+              "Natural language query about the project (e.g. 'What is the art style guide?')",
+          }),
+          max_results: Type.Optional(
+            Type.Number({ description: "Maximum number of results to return (default 5)" }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as { query: string; max_results?: number };
+            const chatroomServerUrl =
+              process.env.CHATROOM_SERVER_URL || cfg.chatroomServerUrl || "http://localhost:8080";
+            const url = `${chatroomServerUrl}/api/rag/query`;
+
+            const response = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                query: p.query,
+                max_results: p.max_results ?? 5,
+              }),
+            });
+
+            if (!response.ok) {
+              const errText = await response.text();
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `RAG query failed (${response.status}): ${errText}`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
+            const data = await response.json();
+            const results = data.results ?? [];
+            if (results.length === 0) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `No RAG results found for: "${p.query}"`,
+                  },
+                ],
+                details: data,
+              };
+            }
+
+            const formatted = results
+              .map(
+                (r: any, i: number) =>
+                  `[${i + 1}] ${r.title ?? r.source ?? "Result"}\n${r.content ?? r.text ?? JSON.stringify(r)}`,
+              )
+              .join("\n\n---\n\n");
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `RAG query: "${p.query}"\n${results.length} results:\n\n${formatted}`,
+                },
+              ],
+              details: data,
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `RAG query error: ${err}. The RAG service may not be running.`,
+                },
+              ],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["rag_query"] },
+    );
 
     // ── Tool: save asset to NAS ───────────────────────────────────────────
 
@@ -3970,7 +4207,7 @@ const agentChatroomPlugin = {
           "Optionally attach files already saved on NAS via asset_paths.",
         parameters: Type.Object({
           channel_id: Type.String({
-            description: "Target channel ID (e.g. 'general', 'pipeline', 'dm_art')",
+            description: "Target channel ID (e.g. 'general', 'dm_art')",
           }),
           text: Type.String({ description: "Message content" }),
           mentions: Type.Optional(
@@ -4051,7 +4288,7 @@ const agentChatroomPlugin = {
           "If you pass a file path as content by mistake, it will be auto-detected and copied correctly.",
         parameters: Type.Object({
           channel_id: Type.String({
-            description: "Target channel ID (e.g. 'general', 'pipeline')",
+            description: "Target channel ID (e.g. 'general', 'dm_art')",
           }),
           filename: Type.String({
             description: "File name with extension (e.g. 'concept_art.png', 'report.md')",
@@ -4263,7 +4500,7 @@ const agentChatroomPlugin = {
               "Absolute path to the file on your local filesystem (e.g. '/workspace/output/render.png')",
           }),
           channel_id: Type.String({
-            description: "Target channel ID (e.g. 'general', 'pipeline', 'dm_art')",
+            description: "Target channel ID (e.g. 'general', 'dm_art')",
           }),
           filename: Type.Optional(
             Type.String({
@@ -5258,9 +5495,13 @@ const agentChatroomPlugin = {
                   case "TASK_ACK":
                     handleTaskAck(cfg, msg, logger);
                     break;
+                  case "DISPATCH_CONFIRMED":
+                    logger.info(
+                      `[handshake] DISPATCH_CONFIRMED received for task ${msg.metadata?.task_id} from ${msg.from}`,
+                    );
+                    break;
                   case "RESULT_REPORT":
                     handleTaskResult(cfg, msg, logger);
-                    // Orchestrator: screen for sensitive operations before forwarding
                     if (cfg.role === "orchestrator") {
                       const screening = sensitivityPreFilter(msg.content.text);
                       if (screening) {
@@ -5286,6 +5527,31 @@ const agentChatroomPlugin = {
                       }
                     }
                     await autoDispatchMessage(cfg, msg, runtime, config, logger);
+                    break;
+                  case "RESULT_ACK":
+                    logger.info(
+                      `[handshake] RESULT_ACK received for task ${msg.metadata?.task_id} — result delivery confirmed`,
+                    );
+                    break;
+                  case "PLAN_QUESTION":
+                    if (cfg.role === "orchestrator") {
+                      await handlePlanQuestion(cfg, msg, runtime, config, logger);
+                    }
+                    break;
+                  case "QUESTION_FORWARD":
+                    if (cfg.role !== "orchestrator") {
+                      await handleQuestionForward(cfg, msg, runtime, config, logger);
+                    }
+                    break;
+                  case "QUESTION_ANSWER":
+                    if (cfg.role === "orchestrator") {
+                      handleQuestionAnswer(cfg, msg, logger);
+                    }
+                    break;
+                  case "ANSWER_FORWARD":
+                    logger.info(
+                      `[question] Answer received for task ${msg.metadata?.source_task_id}: ${msg.content.text.slice(0, 100)}`,
+                    );
                     break;
                   default:
                     await autoDispatchMessage(cfg, msg, runtime, config, logger);
