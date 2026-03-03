@@ -40,8 +40,8 @@
     },
     "ragServiceUrl": {
       "label": "RAG Service URL",
-      "placeholder": "http://192.168.1.100:8000",
-      "help": "URL of the rag_graphrag service. Overridden by RAG_SERVICE_URL env var. Defaults to http://localhost:8000."
+      "placeholder": "http://192.168.1.100:8010",
+      "help": "URL of the rag_graphrag service. Overridden by RAG_SERVICE_URL env var. Defaults to http://localhost:8010."
     }
   },
   "configSchema": {

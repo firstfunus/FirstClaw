@@ -3430,9 +3430,23 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
     `  Example: chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`,
   );
   lines.push(``);
-  lines.push(`═══ RAG (Project Knowledge) ═══`);
+  lines.push(`═══ RAG (Project Knowledge) — MANDATORY ═══`);
   lines.push(`  Use rag_query(query="...") to retrieve project context from the RAG system.`);
-  lines.push(`  Query RAG before making decisions that depend on project specs or history.`);
+  lines.push(`  CRITICAL RULES:`);
+  lines.push(
+    `    1. You MUST call rag_query for ANY question about the project, game, design, specs, or team decisions.`,
+  );
+  lines.push(
+    `    2. ALWAYS query RAG even if you think you already know the answer from prior conversation.`,
+  );
+  lines.push(`       Prior conversation context may contain OUTDATED or FABRICATED information.`);
+  lines.push(
+    `    3. If RAG is unavailable, you MUST explicitly tell the user that the knowledge base is`,
+  );
+  lines.push(`       currently unreachable and you CANNOT provide verified project information.`);
+  lines.push(
+    `    4. NEVER answer project-specific questions from memory alone — RAG is the single source of truth.`,
+  );
   lines.push(``);
   lines.push(`═══ File Sharing Protocol ═══`);
   lines.push(`  Binary files (images, audio, PDFs, models):`);
@@ -3551,11 +3565,12 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  To access files from other agents, resolve their chatroom:// URI with your own NAS root.`,
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
     ``,
-    `═══ RAG (Project Knowledge) ═══`,
+    `═══ RAG (Project Knowledge) — MANDATORY ═══`,
     `  BEFORE starting any task, query the RAG system for project context:`,
     `    rag_query(query="relevant question about the project")`,
-    `  The RAG contains project documentation, design specs, and prior decisions.`,
-    `  Use it to understand requirements, constraints, and existing patterns.`,
+    `  The RAG is the single source of truth for project knowledge.`,
+    `  ALWAYS query RAG — never rely on prior conversation context for project facts.`,
+    `  If RAG is unavailable, state this clearly and do NOT guess project details.`,
     ``,
     `═══ File Sharing Protocol ═══`,
     `  Binary files (images, audio, PDFs, models):`,
@@ -5243,7 +5258,7 @@ const agentChatroomPlugin = {
         async execute(_toolCallId, params) {
           const p = params as { query: string; max_results?: number };
           const ragServiceUrl =
-            process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
+            process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8010";
           const url = `${ragServiceUrl}/query`;
           const reportChannel = resolveReportChannel();
 
@@ -5281,7 +5296,16 @@ const agentChatroomPlugin = {
               }
 
               return {
-                content: [{ type: "text" as const, text: errMsg }],
+                content: [
+                  {
+                    type: "text" as const,
+                    text:
+                      errMsg +
+                      "\n\n⚠️ IMPORTANT: Because the RAG query failed, you have NO verified project knowledge. " +
+                      "Do NOT fabricate or guess project details. If the user's question requires project-specific information, " +
+                      "honestly state that the RAG knowledge base is currently unavailable and you cannot provide an accurate answer.",
+                  },
+                ],
                 details: undefined,
               };
             }
@@ -5345,7 +5369,16 @@ const agentChatroomPlugin = {
             }
 
             return {
-              content: [{ type: "text" as const, text: errMsg }],
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    errMsg +
+                    "\n\n⚠️ IMPORTANT: Because the RAG service is unreachable, you have NO verified project knowledge. " +
+                    "Do NOT fabricate or guess project details. If the user's question requires project-specific information, " +
+                    "honestly state that the RAG knowledge base is currently unavailable and you cannot provide an accurate answer.",
+                },
+              ],
               details: undefined,
             };
           }
