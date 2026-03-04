@@ -178,6 +178,8 @@ export {
 export type { AllowlistMatch } from "../channels/plugins/allowlist-match.js";
 export { formatAllowlistMatchMeta } from "../channels/plugins/allowlist-match.js";
 export { optionalStringEnum, stringEnum } from "../agents/schema/typebox.js";
+export { resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
+export { DEFAULT_TOOLS_FILENAME, resolveDefaultAgentWorkspaceDir } from "../agents/workspace.js";
 export type { PollInput } from "../polls.js";
 
 export { buildChannelConfigSchema } from "../channels/plugins/config-schema.js";

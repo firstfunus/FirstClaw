@@ -42,6 +42,12 @@
       "label": "RAG Service URL",
       "placeholder": "http://192.168.1.100:8000",
       "help": "URL of the rag_graphrag service. Overridden by RAG_SERVICE_URL env var. Defaults to http://localhost:8000."
+    },
+    "workerTaskQueueMaxSize": {
+      "label": "Worker Task Queue Max Size",
+      "placeholder": "100",
+      "help": "Max TASK_DISPATCH queue size for workers. When full, new tasks are dropped. Default 100.",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -73,6 +79,9 @@
       },
       "ragServiceUrl": {
         "type": "string"
+      },
+      "workerTaskQueueMaxSize": {
+        "type": "number"
       }
     },
     "required": ["nasRoot", "agentId"]

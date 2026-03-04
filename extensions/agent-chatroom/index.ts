@@ -21,10 +21,16 @@
 
 import type { FirstClawPluginApi } from "firstclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
-import { createReplyPrefixContext, type ReplyPayload } from "firstclaw/plugin-sdk";
+import {
+  createReplyPrefixContext,
+  DEFAULT_TOOLS_FILENAME,
+  type ReplyPayload,
+  resolveDefaultAgentWorkspaceDir,
+} from "firstclaw/plugin-sdk";
 import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 
 // ============================================================================
@@ -39,6 +45,8 @@ interface ChatroomConfig {
   repoRoot: string | null;
   chatroomServerUrl?: string;
   ragServiceUrl?: string;
+  /** Max worker task queue size (default 100). When full, new TASK_DISPATCH are dropped. */
+  workerTaskQueueMaxSize?: number;
 }
 
 interface AgentRegistryEntry {
@@ -89,6 +97,14 @@ interface ExpectedDeliverables {
   description?: string;
 }
 
+/** Worker-confirmed deliverables (agreed in handshake). Orchestrator does not set this. */
+interface AgreedDeliverables {
+  work_summary?: string;
+  description?: string;
+  /** Each item = one expected file by extension. e.g. [{ extension: ".zip" }, { extension: ".zip" }] = 2 zips. */
+  items: { extension: string }[];
+}
+
 interface TaskRecord {
   task_id: string;
   from: string;
@@ -115,6 +131,10 @@ interface TaskRecord {
   total_steps?: number | null;
   resume_strategy?: ResumeStrategy;
   expected_deliverables?: ExpectedDeliverables;
+  /** Set by Worker via chatroom_confirm_deliverables; used for acceptance validation. Orchestrator does not set. */
+  agreed_deliverables?: AgreedDeliverables | null;
+  /** Set when status is PARKED; used to show how long the task has been waiting. */
+  parked_at?: string | null;
 }
 
 // ── Plan Mode types ──────────────────────────────────────────────────────────
@@ -1956,6 +1976,47 @@ function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
 }
 
 // ============================================================================
+// Worker task queue — serialize TASK_DISPATCH so only one task runs at a time
+// ============================================================================
+
+const WORKER_TASK_QUEUE_MAX_SIZE = 100;
+
+type WorkerTaskQueueEntry = {
+  msg: InboxMessage;
+  cfg: ChatroomConfig;
+  runtime: any;
+  config: any;
+  logger: Logger;
+};
+
+const workerTaskQueue: WorkerTaskQueueEntry[] = [];
+let currentTaskPromise: Promise<void> | null = null;
+/** Set by daemon start; used to log "queue drained" when the last task completes. */
+let workerQueueLogger: Logger | null = null;
+
+function tryDrainWorkerTaskQueue(): void {
+  if (currentTaskPromise != null || workerTaskQueue.length === 0) return;
+  const entry = workerTaskQueue.shift()!;
+  entry.logger.info(
+    `[chatroom] worker task started from queue (depth was ${workerTaskQueue.length + 1})`,
+  );
+  currentTaskPromise = handleIncomingTaskAsync(
+    entry.cfg,
+    entry.msg,
+    entry.runtime,
+    entry.config,
+    entry.logger,
+  );
+  currentTaskPromise.finally(() => {
+    currentTaskPromise = null;
+    if (workerTaskQueue.length === 0 && workerQueueLogger) {
+      workerQueueLogger.info("[chatroom] worker task queue drained");
+    }
+    tryDrainWorkerTaskQueue();
+  });
+}
+
+// ============================================================================
 // Task Registry — persistent task state on NAS
 // ============================================================================
 
@@ -1969,7 +2030,6 @@ function createTaskRecord(
     taskTimeoutMs?: number;
     maxRetries?: number;
     resumeStrategy?: ResumeStrategy;
-    expectedDeliverables?: ExpectedDeliverables;
   },
 ): TaskRecord {
   const dir = tasksDir(cfg);
@@ -1993,7 +2053,7 @@ function createTaskRecord(
     ack_timeout_ms: opts?.ackTimeoutMs ?? 60_000,
     task_timeout_ms: opts?.taskTimeoutMs ?? 3_600_000,
     resume_strategy: getResumeStrategy(to, opts?.resumeStrategy),
-    expected_deliverables: inferExpectedDeliverables(to, instruction, opts?.expectedDeliverables),
+    // Orchestrator does not set expected_deliverables; Worker confirms via agreed_deliverables.
   };
 
   writeJson(path.join(dir, `${task.task_id}.json`), task);
@@ -2128,7 +2188,6 @@ function dispatchTask(
     longRunning?: boolean;
     humanApprovalRequired?: boolean;
     resumeStrategy?: ResumeStrategy;
-    expectedDeliverables?: ExpectedDeliverables;
   },
 ): TaskRecord {
   const channelId = `dm_${to}`;
@@ -2153,7 +2212,7 @@ function dispatchTask(
     session_nonce: sessionNonce,
     human_approval_required: opts?.humanApprovalRequired ?? false,
     resume_strategy: task.resume_strategy,
-    expected_deliverables: task.expected_deliverables,
+    // Orchestrator does not send expected_deliverables; Worker confirms deliverables in handshake.
   });
 
   updateTaskRecord(cfg, task.task_id, {
@@ -2189,51 +2248,72 @@ function sendSystemAck(
 }
 
 /**
- * Filter asset paths based on expected_deliverables contract.
- * Separates final deliverables from intermediate artifacts.
+ * Filter asset paths: when agreed_deliverables exists use it (extension + count);
+ * when legacy expected_deliverables exists use it; otherwise all paths are deliverables.
  */
 function filterDeliverables(
   allPaths: string[],
-  expected: ExpectedDeliverables | undefined,
+  task: TaskRecord,
   logger: Logger,
   taskId: string,
 ): { deliverables: string[]; intermediates: string[] } {
+  const agreed = task.agreed_deliverables;
+  if (agreed?.items?.length) {
+    const byExt = new Map<string, string[]>();
+    for (const p of allPaths) {
+      const ext = path.extname(p).toLowerCase();
+      if (!byExt.has(ext)) byExt.set(ext, []);
+      byExt.get(ext)!.push(p);
+    }
+    const deliverables: string[] = [];
+    for (const item of agreed.items) {
+      const ext = item.extension.startsWith(".")
+        ? item.extension.toLowerCase()
+        : `.${item.extension}`.toLowerCase();
+      const list = byExt.get(ext);
+      if (list?.length) {
+        deliverables.push(list.shift()!);
+      }
+    }
+    const used = new Set(deliverables);
+    const intermediates = allPaths.filter((p) => !used.has(p));
+    if (intermediates.length > 0) {
+      logger.info(
+        `[delivery] Task ${taskId}: filtered ${intermediates.length} intermediate file(s) from deliverables`,
+      );
+    }
+    return { deliverables, intermediates };
+  }
+
+  const expected = task.expected_deliverables;
   if (!expected) return { deliverables: allPaths, intermediates: [] };
 
   const deliverables: string[] = [];
   const intermediates: string[] = [];
-
   for (const p of allPaths) {
     const ext = path.extname(p).toLowerCase();
-
     if (expected.exclude_extensions?.includes(ext)) {
       intermediates.push(p);
       continue;
     }
-
     deliverables.push(p);
   }
-
-  // Validate: if required_extensions specified, at least one must be present
-  if (expected.required_extensions && expected.required_extensions.length > 0) {
+  if (expected.required_extensions?.length) {
     const hasRequired = deliverables.some((p) =>
       expected.required_extensions!.includes(path.extname(p).toLowerCase()),
     );
     if (!hasRequired && deliverables.length > 0) {
       logger.warn(
-        `[delivery] Task ${taskId}: no files matching required extensions ` +
-          `${expected.required_extensions.join(",")} — expected: ${expected.description ?? "required assets"}`,
+        `[delivery] Task ${taskId}: no files matching required extensions ${expected.required_extensions.join(",")}`,
       );
     }
   }
-
   if (intermediates.length > 0) {
     logger.info(
       `[delivery] Task ${taskId}: filtered ${intermediates.length} intermediate file(s) from deliverables: ` +
         intermediates.map((p) => path.basename(p)).join(", "),
     );
   }
-
   return { deliverables, intermediates };
 }
 
@@ -2254,13 +2334,8 @@ function sendTaskResult(
     return;
   }
 
-  // Programmatic filter: separate deliverables from intermediate artifacts
-  const { deliverables } = filterDeliverables(
-    assetPaths,
-    task.expected_deliverables,
-    logger,
-    taskId,
-  );
+  // Programmatic filter: use agreed_deliverables when set, else legacy expected_deliverables, else all
+  const { deliverables } = filterDeliverables(assetPaths, task, logger, taskId);
   const uriAssetPaths = deliverables.map((p) => toChatroomUri(p, cfg));
 
   // Workers send DELIVERED (not DONE). Only the orchestrator can close a task after review.
@@ -2296,6 +2371,77 @@ function sendTaskResult(
   logger.info(
     `Result DELIVERED for task ${taskId} (${reportStatus}${errorType ? ` [${errorType}]` : ""}) → ${task.from}`,
   );
+}
+
+/**
+ * Validate that delivered asset_paths match agreed_deliverables and files exist with content.
+ * Used by chatroom_close_task(verdict="accepted").
+ */
+function validateDeliveryForAcceptance(
+  cfg: ChatroomConfig,
+  task: TaskRecord,
+  logger: Logger,
+): { ok: true } | { ok: false; reason: string } {
+  const agreed = task.agreed_deliverables;
+  if (!agreed?.items?.length) {
+    return {
+      ok: false,
+      reason:
+        "No agreed deliverables on this task. The worker must call chatroom_confirm_deliverables before planning; acceptance cannot proceed without an agreement.",
+    };
+  }
+  const paths = task.asset_paths ?? [];
+  if (paths.length === 0) {
+    return {
+      ok: false,
+      reason: "No files delivered. The worker must attach the agreed deliverables.",
+    };
+  }
+  const expectedByExt = new Map<string, number>();
+  for (const item of agreed.items) {
+    const ext = item.extension.startsWith(".")
+      ? item.extension.toLowerCase()
+      : `.${item.extension}`.toLowerCase();
+    expectedByExt.set(ext, (expectedByExt.get(ext) ?? 0) + 1);
+  }
+  const deliveredByExt = new Map<string, string[]>();
+  for (const uri of paths) {
+    const ext = path.extname(uri).toLowerCase();
+    if (!deliveredByExt.has(ext)) deliveredByExt.set(ext, []);
+    deliveredByExt.get(ext)!.push(uri);
+  }
+  for (const [ext, count] of expectedByExt) {
+    const list = deliveredByExt.get(ext) ?? [];
+    if (list.length !== count) {
+      return {
+        ok: false,
+        reason: `Agreed deliverables require exactly ${count} file(s) with extension ${ext}, but ${list.length} delivered.`,
+      };
+    }
+  }
+  for (const ext of deliveredByExt.keys()) {
+    if (!expectedByExt.has(ext)) {
+      return {
+        ok: false,
+        reason: `Delivered file(s) with extension ${ext} were not in the agreed deliverables.`,
+      };
+    }
+  }
+  for (const uri of paths) {
+    try {
+      const localPath = fromChatroomUri(uri, cfg);
+      if (!fs.existsSync(localPath)) {
+        return { ok: false, reason: `File not found: ${uri} (resolved to ${localPath}).` };
+      }
+      const stat = fs.statSync(localPath);
+      if (!stat.isFile() || stat.size <= 0) {
+        return { ok: false, reason: `File empty or not a file: ${uri}.` };
+      }
+    } catch (err) {
+      return { ok: false, reason: `Cannot validate file ${uri}: ${err}.` };
+    }
+  }
+  return { ok: true };
 }
 
 function cancelTask(
@@ -2769,13 +2915,13 @@ function sensitivityPreFilter(
 // Daemon message handlers — route by message type
 // ============================================================================
 
-function handleIncomingTask(
+async function handleIncomingTaskAsync(
   cfg: ChatroomConfig,
   msg: InboxMessage,
   runtime: any,
   config: any,
   logger: Logger,
-): void {
+): Promise<void> {
   const taskId = msg.metadata?.task_id;
   if (!taskId) {
     logger.warn(`TASK_DISPATCH without task_id from ${msg.from}, ignoring`);
@@ -2855,15 +3001,17 @@ function handleIncomingTask(
   const isLongRunning = Boolean(msg.metadata?.long_running);
   const usePlanMode = shouldUsePlanMode(msg.content.text, isLongRunning);
 
-  if (usePlanMode) {
-    logger.info(`Task ${taskId}: using Plan Mode (long_running=${isLongRunning})`);
-    handlePlanModeTask(cfg, msg, taskId, runtime, config, logger).catch((err) => {
-      logger.error(`Plan mode unhandled error for task ${taskId}: ${err}`);
-      sendTaskResult(cfg, taskId, `Plan mode crashed: ${err}`, "FAILED", logger);
-    });
-  } else {
-    logger.info(`Task ${taskId}: using direct execution (simple task)`);
-    autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
+  try {
+    if (usePlanMode) {
+      logger.info(`Task ${taskId}: using Plan Mode (long_running=${isLongRunning})`);
+      await handlePlanModeTask(cfg, msg, taskId, runtime, config, logger);
+    } else {
+      logger.info(`Task ${taskId}: using direct execution (simple task)`);
+      await autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
+    }
+  } catch (err) {
+    logger.error(`Unhandled error for task ${taskId}: ${err}`);
+    sendTaskResult(cfg, taskId, `Task crashed: ${err}`, "FAILED", logger);
   }
 }
 
@@ -3649,67 +3797,19 @@ async function autoDispatchMessage(
         ? `\nDelivered files:\n${assetPaths.map((p) => `  • ${p}`).join("\n")}`
         : "\n(No files delivered)";
 
-    // Detect if the original task likely expected visual/binary deliverables
     const taskRecord = taskId ? readTaskRecord(chatroomCfg, taskId) : null;
-    const instruction = taskRecord?.instruction?.toLowerCase() ?? "";
-    const VISUAL_KEYWORDS = [
-      "generate",
-      "render",
-      "create",
-      "draw",
-      "design",
-      "produce",
-      "make",
-      "build",
-    ];
-    const VISUAL_ASSET_KEYWORDS = [
-      "image",
-      "picture",
-      "sprite",
-      "icon",
-      "texture",
-      "model",
-      "audio",
-      "sound",
-      "music",
-      "video",
-      "animation",
-      "file",
-      "asset",
-    ];
-    const expectsVisualAssets =
-      VISUAL_KEYWORDS.some((k) => instruction.includes(k)) &&
-      VISUAL_ASSET_KEYWORDS.some((k) => instruction.includes(k));
-    const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".psd", ".tiff"];
-    const BINARY_EXTS = [
-      ...IMAGE_EXTS,
-      ".wav",
-      ".mp3",
-      ".ogg",
-      ".fbx",
-      ".glb",
-      ".gltf",
-      ".obj",
-      ".blend",
-      ".zip",
-    ];
-    const hasBinaryAssets = assetPaths.some((p) =>
-      BINARY_EXTS.some((ext) => p.toLowerCase().endsWith(ext)),
-    );
-    const deliveryWarning =
-      expectsVisualAssets && !hasBinaryAssets
-        ? `\n\n🚨 WARNING: The original instruction appears to request visual/binary deliverables ` +
-          `(keywords: ${VISUAL_KEYWORDS.filter((k) => instruction.includes(k)).join(", ")}), ` +
-          `but ONLY text/document files were delivered. ` +
-          `You should REJECT this result and ask the agent to produce the actual assets, not just documentation.`
-        : "";
+    const agreed = taskRecord?.agreed_deliverables;
+    const reviewHint = agreed
+      ? `Review ONLY against the agreed deliverables (${agreed.items.map((i) => i.extension).join(", ")}). ` +
+        `If the worker delivered what they agreed (e.g. two .zip files), accept it. Do not reject based on your own assumptions (e.g. expecting .ipa/.apk). `
+      : `No agreed_deliverables on record; accept only if you are satisfied. `;
 
     messageBody =
       `[RESULT_REPORT from ${senderLabel}] Task ${taskId ?? "unknown"}${assetSection}\n\n` +
       `${msg.content.text}\n\n` +
-      `⚠️ ACTION REQUIRED: Review the deliverables above. ` +
+      `⚠️ ACTION REQUIRED: ${reviewHint}` +
       `Use chatroom_list_assets to verify files exist, then call chatroom_close_task(task_id="${taskId}", verdict="accepted") ` +
-      `to close, or verdict="rejected" with a comment to request rework.${deliveryWarning}`;
+      `to close, or verdict="rejected" with a comment to request rework.`;
   } else {
     messageBody = `[Chatroom #${channelId}] ${senderLabel}: ${msg.content.text}`;
   }
@@ -3821,9 +3921,114 @@ function shouldUsePlanMode(instruction: string, isLongRunning: boolean): boolean
   return true;
 }
 
+const DELIVERABLES_FILENAME = "DELIVERABLES.md";
+
+/**
+ * Fetch RAG context and (for workers only) TOOLS.md + DELIVERABLES.md for the planning phase (before Plan).
+ * Worker must use DELIVERABLES.md to decide what to declare in chatroom_confirm_deliverables.
+ */
+async function fetchPlanningContext(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  taskId: string,
+  _config: any,
+  logger: Logger,
+): Promise<{ ragText: string; toolsMdText: string; deliverablesMdText: string }> {
+  const reportChannel = cfg.role === "orchestrator" ? "general" : `dm_${cfg.agentId}`;
+  const ragServiceUrl = process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
+  const query = msg.content.text.trim().slice(0, 500) || "Project context and conventions";
+
+  // ── 1. Query RAG ───────────────────────────────────────────────────────
+  let ragText: string;
+  try {
+    sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] ${query}`, "STATUS_UPDATE");
+  } catch (e) {
+    logger.warn(`RAG report (QUERY) failed: ${e}`);
+  }
+  try {
+    const response = await fetch(`${ragServiceUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, top_k: 5 }),
+    });
+    if (!response.ok) {
+      ragText = `RAG query failed (${response.status}). Proceed with your best judgment; do not fabricate project details.`;
+      try {
+        sendMessageToNAS(cfg, reportChannel, `[RAG][ERROR] ${ragText}`, "STATUS_UPDATE");
+      } catch {
+        /* ignore */
+      }
+    } else {
+      const data = (await response.json()) as {
+        answer: string;
+        sources?: { text: string; source: string; score: number }[];
+        strategy?: string;
+      };
+      ragText =
+        `Answer:\n${data.answer}\n` +
+        (data.sources?.length
+          ? `\nSources:\n${data.sources.map((s, i) => `[${i + 1}] ${s.source}\n${s.text}`).join("\n\n")}`
+          : "");
+      try {
+        sendMessageToNAS(
+          cfg,
+          reportChannel,
+          `[RAG][RESPONSE] strategy: ${data.strategy ?? "unknown"}\n${data.answer}`,
+          "STATUS_UPDATE",
+        );
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch (err) {
+    ragText = `RAG unavailable: ${err}. Proceed with your best judgment; do not fabricate project details.`;
+    try {
+      sendMessageToNAS(cfg, reportChannel, `[RAG][ERROR] ${ragText}`, "STATUS_UPDATE");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ── 2. Read TOOLS.md only for workers; from default/base workspace ───────
+  let toolsMdText = "";
+  let deliverablesMdText = "";
+  if (cfg.role === "worker") {
+    const workspaceDir = resolveDefaultAgentWorkspaceDir();
+    try {
+      const toolsPath = path.join(workspaceDir, DEFAULT_TOOLS_FILENAME);
+      if (fs.existsSync(toolsPath)) {
+        toolsMdText = await readFile(toolsPath, "utf-8");
+      } else {
+        toolsMdText = `(No ${DEFAULT_TOOLS_FILENAME} found in default workspace ${workspaceDir}. Use the tools available to this agent as documented in your system prompt.)`;
+      }
+    } catch (err) {
+      toolsMdText = `(Could not load TOOLS.md: ${err}. Rely on your registered tools and system prompt for capabilities.)`;
+      logger.warn(`Planning context: TOOLS.md read failed: ${err}`);
+    }
+    // ── 3. Read DELIVERABLES.md (mandatory before deliverables confirmation) ─
+    try {
+      const deliverablesPath = path.join(workspaceDir, DELIVERABLES_FILENAME);
+      if (fs.existsSync(deliverablesPath)) {
+        deliverablesMdText = await readFile(deliverablesPath, "utf-8");
+      } else {
+        deliverablesMdText = `(No ${DELIVERABLES_FILENAME} in default workspace ${workspaceDir}. Declare what you will deliver based on the task instruction and your role.)`;
+        logger.warn(
+          `Planning context: ${DELIVERABLES_FILENAME} not found; agent will confirm from instruction.`,
+        );
+      }
+    } catch (err) {
+      deliverablesMdText = `(Could not load ${DELIVERABLES_FILENAME}: ${err}. Declare deliverables from the task instruction.)`;
+      logger.warn(`Planning context: DELIVERABLES.md read failed: ${err}`);
+    }
+  }
+
+  return { ragText, toolsMdText, deliverablesMdText };
+}
+
 /**
  * Phase 1: Short LLM call to produce a structured plan.
  * Returns the created plan, or null if planning was skipped/failed.
+ * Before planning, we inject RAG context and TOOLS.md so the agent knows project facts and its own tools.
  */
 async function planningPhase(
   chatroomCfg: ChatroomConfig,
@@ -3842,20 +4047,54 @@ async function planningPhase(
     peer: { kind: isDM ? "direct" : "group", id: channelId },
   });
 
-  // Build deliverables context so the agent knows what's expected
+  // Pre-step: query RAG and (for workers only) load TOOLS.md + DELIVERABLES.md from default workspace (before Plan)
+  appendTaskProgress(chatroomCfg, taskId, {
+    phase: "planning",
+    detail:
+      chatroomCfg.role === "worker"
+        ? "Querying RAG, loading TOOLS.md and DELIVERABLES.md"
+        : "Querying RAG",
+  });
+  const { ragText, toolsMdText, deliverablesMdText } = await fetchPlanningContext(
+    chatroomCfg,
+    msg,
+    taskId,
+    config,
+    logger,
+  );
+
   const taskRecord = readTaskRecord(chatroomCfg, taskId);
-  const expectedDel = taskRecord?.expected_deliverables;
-  const deliverableContext = expectedDel
-    ? `\nEXPECTED DELIVERABLES: ${expectedDel.description ?? "see extensions below"}` +
-      (expectedDel.required_extensions?.length
-        ? `\n  Required file types: ${expectedDel.required_extensions.join(", ")}`
-        : "") +
-      (expectedDel.exclude_extensions?.length
-        ? `\n  Excluded from delivery: ${expectedDel.exclude_extensions.join(", ")} (these are filtered out automatically)`
-        : "")
+  const agreedDel = taskRecord?.agreed_deliverables;
+  const deliverableContext = agreedDel
+    ? `\nAGREED DELIVERABLES (you already confirmed): ${agreedDel.items.map((i) => i.extension).join(", ")}` +
+      (agreedDel.work_summary ? ` — ${agreedDel.work_summary}` : "")
     : "";
 
-  const planningPrompt = [
+  const planningPromptParts: string[] = [
+    ``,
+    `═══ RAG CONTEXT (retrieved before planning — use for project knowledge) ═══`,
+    ragText,
+    ``,
+  ];
+  if (toolsMdText) {
+    planningPromptParts.push(
+      `═══ YOUR TOOLS (TOOLS.md from default workspace — your capabilities and how to use them) ═══`,
+      toolsMdText,
+      ``,
+    );
+  }
+  if (deliverablesMdText) {
+    planningPromptParts.push(
+      `═══ DELIVERABLES.md (MANDATORY — read and use for chatroom_confirm_deliverables) ═══`,
+      `You MUST use the content below to decide what to declare. Do not confirm deliverables without it.`,
+      ``,
+      deliverablesMdText,
+      ``,
+    );
+  }
+  planningPromptParts.push(
+    `═══ TASK & PLANNING INSTRUCTIONS ═══`,
+    ``,
     `[CHATROOM TASK — PLANNING PHASE]`,
     `task_id: ${taskId}`,
     `assigned_by: ${msg.from}`,
@@ -3863,6 +4102,11 @@ async function planningPhase(
     `INSTRUCTION:`,
     msg.content.text,
     deliverableContext,
+    ``,
+    `MANDATORY — Deliverables confirmation (use DELIVERABLES.md above):`,
+    `  If you have NOT yet called chatroom_confirm_deliverables for this task, you MUST call it FIRST.`,
+    `  Use the DELIVERABLES.md content above to set items (e.g. items: [{ extension: ".zip" }, { extension: ".zip" }]).`,
+    `  The orchestrator will only accept files that match this agreement. Then call chatroom_create_plan.`,
     ``,
     `You are in PLANNING MODE. Do NOT execute the task yet.`,
     `Analyze the instruction and create a structured execution plan.`,
@@ -3891,7 +4135,8 @@ async function planningPhase(
     `    expects visual/binary output. Only actual asset files will be delivered to the requester.`,
     `  - Example: if asked to "generate an image", your plan must include a step that actually`,
     `    generates the image file — writing a description of the image is NOT a valid deliverable.`,
-  ].join("\n");
+  );
+  const planningPrompt = planningPromptParts.join("\n");
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
     Body: planningPrompt,
@@ -4413,27 +4658,19 @@ async function autoDispatchForTask(
     : taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
   ensureDir(outputDir);
 
-  // Surface expected deliverables so the agent knows what to produce
-  const metaDeliverables = msg.metadata?.expected_deliverables as ExpectedDeliverables | undefined;
+  // Surface agreed deliverables (Worker confirmed at handshake); no orchestrator assumption
   const taskRecord = readTaskRecord(chatroomCfg, taskId);
-  const expectedDel = metaDeliverables ?? taskRecord?.expected_deliverables;
-  const deliverableHint = expectedDel
+  const agreedDel = taskRecord?.agreed_deliverables;
+  const deliverableHint = agreedDel
     ? [
         ``,
-        `EXPECTED DELIVERABLES:`,
-        `  ${expectedDel.description ?? "See file type constraints below."}`,
-        ...(expectedDel.required_extensions?.length
-          ? [`  Required file types: ${expectedDel.required_extensions.join(", ")}`]
-          : []),
-        ...(expectedDel.exclude_extensions?.length
-          ? [
-              `  Auto-excluded from delivery: ${expectedDel.exclude_extensions.join(", ")} (intermediate artifacts)`,
-            ]
-          : []),
-        `  IMPORTANT: Only files matching the required types will be delivered to the requester.`,
-        `  Documentation, plans, and notes are for YOUR process only — they are NOT deliverables.`,
-      ].join("\n")
-    : "";
+        `AGREED DELIVERABLES (you confirmed): ${agreedDel.items.map((i) => i.extension).join(", ")}`,
+        agreedDel.description ? `  ${agreedDel.description}` : "",
+        `  Only these file types will be accepted. Documentation/notes are NOT deliverables.`,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    : `\nYou must have called chatroom_confirm_deliverables before planning. Deliver only what you agreed.`;
 
   const taskContext = [
     `[CHATROOM TASK — STRICT PROTOCOL]`,
@@ -4628,6 +4865,10 @@ const agentChatroomPlugin = {
       localDir: (pluginCfg.localDir as string) ?? "./chatroom_local",
       repoRoot: (pluginCfg.repoRoot as string) ?? null,
       ragServiceUrl: (pluginCfg.ragServiceUrl as string) ?? undefined,
+      workerTaskQueueMaxSize:
+        typeof pluginCfg.workerTaskQueueMaxSize === "number"
+          ? pluginCfg.workerTaskQueueMaxSize
+          : undefined,
     };
     ensureDir(cfg.localDir);
     ensureDir(tasksDir(cfg));
@@ -4702,33 +4943,6 @@ const agentChatroomPlugin = {
                   "Defaults based on target agent (art/audio=continue, git=wait_and_check, else=restart).",
               }),
             ),
-            expected_deliverables: Type.Optional(
-              Type.Object(
-                {
-                  required_extensions: Type.Optional(
-                    Type.Array(Type.String(), {
-                      description: 'File extensions the task MUST deliver (e.g. [".png", ".wav"])',
-                    }),
-                  ),
-                  exclude_extensions: Type.Optional(
-                    Type.Array(Type.String(), {
-                      description: "File extensions to automatically exclude from delivery",
-                    }),
-                  ),
-                  description: Type.Optional(
-                    Type.String({
-                      description: 'Human-readable description (e.g. "rendered image files")',
-                    }),
-                  ),
-                },
-                {
-                  description:
-                    "Declare expected deliverable file types. If omitted, defaults are inferred " +
-                    "from the target agent and instruction keywords. Intermediate artifacts " +
-                    "(plans, notes, docs) matching exclude_extensions are automatically filtered out.",
-                },
-              ),
-            ),
           }),
           async execute(_toolCallId, params) {
             try {
@@ -4738,7 +4952,6 @@ const agentChatroomPlugin = {
                 timeout_minutes?: number;
                 long_running?: boolean;
                 resume_strategy?: ResumeStrategy;
-                expected_deliverables?: ExpectedDeliverables;
               };
               const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
               let instruction = p.instruction;
@@ -4753,7 +4966,6 @@ const agentChatroomPlugin = {
                 taskTimeoutMs: timeoutMs,
                 longRunning: p.long_running,
                 resumeStrategy: p.resume_strategy,
-                expectedDeliverables: p.expected_deliverables,
               });
               return {
                 content: [
@@ -4766,13 +4978,8 @@ const agentChatroomPlugin = {
                       `  timeout: ${p.timeout_minutes ?? 60} minutes\n` +
                       `  long_running: ${p.long_running ?? false}\n` +
                       `  resume_strategy: ${task.resume_strategy}\n` +
-                      `  expected_deliverables: ${task.expected_deliverables?.description ?? "auto-inferred"}\n` +
                       `  status: DISPATCHED (awaiting ACK)\n` +
-                      `The system will auto-retry if ${p.target} doesn't respond.\n` +
-                      (task.expected_deliverables
-                        ? `Note: intermediate artifacts (${task.expected_deliverables.exclude_extensions?.join(", ") ?? "none"}) ` +
-                          `will be automatically filtered from the final delivery.`
-                        : ""),
+                      `The worker will confirm what they will deliver; you accept only against that agreement.`,
                   },
                 ],
                 details: task,
@@ -4835,6 +5042,18 @@ const agentChatroomPlugin = {
                 }
 
                 if (p.verdict === "accepted") {
+                  const validation = validateDeliveryForAcceptance(cfg, task, logger);
+                  if (!validation.ok) {
+                    return {
+                      content: [
+                        {
+                          type: "text" as const,
+                          text: `Cannot accept task ${p.task_id}: ${validation.reason} Use verdict="rejected" with a comment to request rework.`,
+                        },
+                      ],
+                      details: undefined,
+                    };
+                  }
                   updateTaskRecord(cfg, p.task_id, {
                     status: "DONE",
                     completed_at: nowISO(),
@@ -6111,6 +6330,136 @@ const agentChatroomPlugin = {
       { names: ["chatroom_task_progress"] },
     );
 
+    // ── Tool: confirm deliverables (Worker only; handshake before planning) ─
+
+    api.registerTool(
+      {
+        name: "chatroom_confirm_deliverables",
+        label: "Chatroom: Confirm Deliverables",
+        description:
+          "Declare what you will deliver for this task. You MUST call this before creating your plan.\n" +
+          "The orchestrator will only accept deliverables that match this agreement (e.g. two .zip files).\n" +
+          "Do not assume the orchestrator expects specific formats — you declare what you will produce.",
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID" }),
+          work_summary: Type.Optional(
+            Type.String({ description: "One-sentence summary of what you will do" }),
+          ),
+          description: Type.Optional(
+            Type.String({ description: "Short description of the deliverables" }),
+          ),
+          items: Type.Array(
+            Type.Object({
+              extension: Type.String({
+                description: 'File extension including dot, e.g. ".zip", ".ipa", ".apk"',
+              }),
+            }),
+            {
+              description:
+                'List of expected files by extension. One item per file. e.g. [{ extension: ".zip" }, { extension: ".zip" }] for two zips.',
+            },
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              task_id: string;
+              work_summary?: string;
+              description?: string;
+              items: { extension: string }[];
+            };
+            if (cfg.role !== "worker") {
+              return {
+                content: [
+                  { type: "text" as const, text: "Only workers can confirm deliverables." },
+                ],
+                details: undefined,
+              };
+            }
+            const task = readTaskRecord(cfg, p.task_id);
+            if (!task) {
+              return {
+                content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
+                details: undefined,
+              };
+            }
+            if (task.to !== cfg.agentId) {
+              return {
+                content: [{ type: "text" as const, text: "This task is not assigned to you." }],
+                details: undefined,
+              };
+            }
+            if (task.agreed_deliverables) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Deliverables already confirmed for task ${p.task_id}. No change.`,
+                  },
+                ],
+                details: task.agreed_deliverables,
+              };
+            }
+            if (!p.items?.length) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: 'items must be a non-empty array of { extension: ".ext" }.',
+                  },
+                ],
+                details: undefined,
+              };
+            }
+            const agreed: AgreedDeliverables = {
+              work_summary: p.work_summary,
+              description: p.description,
+              items: p.items.map((i) => ({
+                extension: i.extension.startsWith(".") ? i.extension : `.${i.extension}`,
+              })),
+            };
+            updateTaskRecord(cfg, p.task_id, {
+              agreed_deliverables: agreed,
+            } as Partial<TaskRecord>);
+            const summary =
+              `Task ${p.task_id} **deliverables confirmed** by ${cfg.agentId}. ` +
+              `Will deliver: ${agreed.items.map((i) => i.extension).join(", ")}` +
+              (agreed.work_summary ? ` — ${agreed.work_summary}` : ".");
+            sendMessageToNAS(
+              cfg,
+              task.channel_id,
+              summary,
+              "TASK_DELIVERABLES_CONFIRMED",
+              [task.from],
+              undefined,
+              {
+                task_id: p.task_id,
+                agreed_deliverables: agreed,
+              },
+            );
+            logger.info(
+              `Task ${p.task_id}: agreed_deliverables set (${agreed.items.length} item(s))`,
+            );
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Deliverables confirmed. You can now call chatroom_create_plan.`,
+                },
+              ],
+              details: agreed,
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_confirm_deliverables"] },
+    );
+
     // ── Tool: park a task for long-running operations ───────────────────────
 
     api.registerTool(
@@ -6240,14 +6589,37 @@ const agentChatroomPlugin = {
 
             writeParkedTask(cfg, parkedInfo);
 
+            const parkedAt = nowISO();
             updateTaskRecord(cfg, p.task_id, {
               status: "PARKED",
               current_phase: `parked_${watchType}`,
+              parked_at: parkedAt,
             } as Partial<TaskRecord>);
             appendTaskProgress(cfg, p.task_id, {
               phase: "parked",
               detail: `Parked: watching ${watchType} (poll every ${pollInterval / 1000}s, max ${maxWaitMinutes}min)`,
             });
+
+            // Notify orchestrator so it knows the task is waiting, not failed
+            const parkSummary =
+              `Task ${p.task_id} is **PARKED** (waiting for ${watchType}). ` +
+              `Max wait: ${maxWaitMinutes} min. Parked at ${parkedAt}. ` +
+              `The agent will resume automatically when the condition is met.`;
+            sendMessageToNAS(
+              cfg,
+              task.channel_id,
+              parkSummary,
+              "TASK_PARKED",
+              [task.from],
+              undefined,
+              {
+                task_id: p.task_id,
+                status: "PARKED",
+                parked_at: parkedAt,
+                max_wait_minutes: maxWaitMinutes,
+                watch_type: watchType,
+              },
+            );
 
             logger.info(
               `Task ${p.task_id} PARKED: ${watchType}, poll ${pollInterval}ms, max ${maxWaitMinutes}min`,
@@ -6697,6 +7069,7 @@ const agentChatroomPlugin = {
         logger.info(
           `Chatroom daemon starting for agent=${agentId}, role=${cfg.role.toUpperCase()} (task protocol enabled)`,
         );
+        if (cfg.role === "worker") workerQueueLogger = logger;
 
         // Start NAS health monitor and register sync + task-resume callbacks
         startNasHealthMonitor(cfg, logger);
@@ -6851,7 +7224,21 @@ const agentChatroomPlugin = {
 
                 switch (msg.type) {
                   case "TASK_DISPATCH":
-                    handleIncomingTask(cfg, msg, runtime, config, logger);
+                    if (cfg.role === "worker") {
+                      const maxQueueSize = cfg.workerTaskQueueMaxSize ?? WORKER_TASK_QUEUE_MAX_SIZE;
+                      if (workerTaskQueue.length >= maxQueueSize) {
+                        logger.warn(
+                          `[chatroom] worker task queue full (${maxQueueSize}), dropping TASK_DISPATCH ${msg.metadata?.task_id}`,
+                        );
+                      } else {
+                        workerTaskQueue.push({ msg, cfg, runtime, config, logger });
+                        logger.info(
+                          `[chatroom] worker task enqueued, queue depth=${workerTaskQueue.length}`,
+                        );
+                      }
+                    } else {
+                      void handleIncomingTaskAsync(cfg, msg, runtime, config, logger);
+                    }
                     break;
                   case "TASK_ACK":
                     handleTaskAck(cfg, msg, logger);
@@ -6922,6 +7309,8 @@ const agentChatroomPlugin = {
                 logger.error(`Message handling failed for ${msg.message_id}: ${err}`);
               }
             }
+            // After processing batch: drain worker task queue (one task at a time)
+            if (cfg.role === "worker") tryDrainWorkerTaskQueue();
           } catch (err) {
             logger.error(`[poll] Poll cycle failed: ${err}`);
           }
@@ -6949,6 +7338,7 @@ const agentChatroomPlugin = {
       },
       stop: async () => {
         stopNasHealthMonitor();
+        workerQueueLogger = null;
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (pollTimer) clearInterval(pollTimer);
         if (taskMonitorTimer) clearInterval(taskMonitorTimer);
