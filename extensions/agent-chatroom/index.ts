@@ -3016,9 +3016,9 @@ async function handleIncomingTaskAsync(
 }
 
 /**
- * Plan Mode: planning phase -> autonomous execution (no orchestrator approval).
- * If human_approval_required flag is set (from /human command), wait for human approval.
- * Otherwise, the agent executes its plan autonomously.
+ * Plan Mode: planning phase -> then execution.
+ * Human approval is required ONLY when the task was dispatched with /human (human_approval_required on TASK_DISPATCH).
+ * Otherwise the plan is auto-approved. Sensitive operations use #permission (chatroom_request_permission) separately.
  */
 async function handlePlanModeTask(
   cfg: ChatroomConfig,
@@ -3037,11 +3037,10 @@ async function handlePlanModeTask(
       return;
     }
 
-    // Check if human approval is required (from /human command)
+    // Human approval ONLY when task was explicitly dispatched with /human (human_approval_required on TASK_DISPATCH).
+    // Do not use msg.metadata here — only the task record (set at dispatch time) counts. Sensitive ops use #permission.
     const task = readTaskRecord(cfg, taskId);
-    const needsHumanApproval = Boolean(
-      (task as any)?.human_approval_required || msg.metadata?.human_approval_required,
-    );
+    const needsHumanApproval = (task as any)?.human_approval_required === true;
 
     let approvedPlan: TaskPlan | null;
 
@@ -3576,6 +3575,9 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   lines.push(``);
   lines.push(
     `  Example: chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`,
+  );
+  lines.push(
+    `  Human approval: pass human_approval_required: true ONLY when the user explicitly used /human; otherwise plans are auto-approved. Sensitive ops use #permission.`,
   );
   lines.push(``);
   lines.push(`═══ RAG (Project Knowledge) — MANDATORY ═══`);
@@ -4943,6 +4945,14 @@ const agentChatroomPlugin = {
                   "Defaults based on target agent (art/audio=continue, git=wait_and_check, else=restart).",
               }),
             ),
+            human_approval_required: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Set to true ONLY when the user explicitly used /human in their request. " +
+                  "Otherwise omit or pass false so the worker's plan is auto-approved. " +
+                  "Sensitive operations use #permission (chatroom_request_permission) separately.",
+              }),
+            ),
           }),
           async execute(_toolCallId, params) {
             try {
@@ -4952,6 +4962,7 @@ const agentChatroomPlugin = {
                 timeout_minutes?: number;
                 long_running?: boolean;
                 resume_strategy?: ResumeStrategy;
+                human_approval_required?: boolean;
               };
               const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
               let instruction = p.instruction;
@@ -4966,6 +4977,7 @@ const agentChatroomPlugin = {
                 taskTimeoutMs: timeoutMs,
                 longRunning: p.long_running,
                 resumeStrategy: p.resume_strategy,
+                humanApprovalRequired: p.human_approval_required === true,
               });
               return {
                 content: [
