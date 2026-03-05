@@ -2646,6 +2646,32 @@ function finalizeTaskProgress(cfg: ChatroomConfig, taskId: string): void {
   }
 }
 
+// --- Logging helpers: tool name extraction & secret redaction ----------------
+
+const _SECRET_PATTERNS: RegExp[] = [
+  /(?:api[_-]?key|apikey)\s*[:=]\s*\S+/gi,
+  /(?:secret|token|password|passwd|pwd)\s*[:=]\s*\S+/gi,
+  /Bearer\s+\S+/g,
+  /sk-[a-zA-Z0-9]{20,}/g,
+];
+
+function _redactDetail(text: string): string {
+  let result = text;
+  for (const pat of _SECRET_PATTERNS) {
+    result = result.replace(pat, "[REDACTED]");
+  }
+  return result;
+}
+
+function _extractToolName(payload: ReplyPayload): string {
+  const explicit = (payload as Record<string, unknown>).toolName;
+  if (explicit && typeof explicit === "string") return explicit;
+  const text = payload.text ?? "";
+  // formatToolAggregate output starts with "<emoji> <ToolLabel>: ..."
+  const m = text.match(/^\S+\s+(\S+)/);
+  return m?.[1]?.replace(/:$/, "") ?? "tool";
+}
+
 // ============================================================================
 // Task Parking — suspend long-running tasks without holding LLM sessions
 // ============================================================================
@@ -4265,9 +4291,11 @@ async function planningPhase(
     deliver: async (payload: ReplyPayload, info?: { kind: string }) => {
       const kind = info?.kind ?? "final";
       if (kind === "tool") {
+        const toolName = _extractToolName(payload);
+        const rawDetail = (payload.text ?? "").slice(0, 200);
         appendTaskProgress(chatroomCfg, taskId, {
           phase: "planning_tool",
-          detail: (payload.text ?? "").slice(0, 200),
+          detail: `[${toolName}] ${_redactDetail(rawDetail)}`,
         });
       }
       if (kind === "final") {
@@ -4689,7 +4717,9 @@ async function executeStep(
       const kind = info?.kind ?? "final";
 
       if (kind === "tool") {
-        const detail = text.slice(0, 200);
+        const toolName = _extractToolName(payload);
+        const rawDetail = text.slice(0, 200);
+        const detail = `[${toolName}] ${_redactDetail(rawDetail)}`;
         lastActivityDetail = detail;
         appendTaskProgress(chatroomCfg, taskId, {
           phase: `step_${step.order}_tool`,
@@ -4951,9 +4981,11 @@ async function autoDispatchForTask(
       const kind = info?.kind ?? "final";
 
       if (kind === "tool") {
+        const toolName = _extractToolName(payload);
+        const rawDetail = text.slice(0, 300);
         appendTaskProgress(chatroomCfg, taskId, {
           phase: "tool_executed",
-          detail: text.slice(0, 300),
+          detail: `[${toolName}] ${_redactDetail(rawDetail)}`,
         });
         return;
       }

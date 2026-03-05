@@ -13,6 +13,8 @@ import {
 import { inferToolMetaFromArgs } from "./pi-embedded-utils.js";
 import { normalizeToolName } from "./tool-policy.js";
 
+const toolStartTimes = new Map<string, number>();
+
 function extendExecMeta(toolName: string, args: unknown, meta?: string): string | undefined {
   const normalized = toolName.trim().toLowerCase();
   if (normalized !== "exec" && normalized !== "bash") {
@@ -66,6 +68,10 @@ export async function handleToolExecutionStart(
   ctx.state.toolMetaById.set(toolCallId, meta);
   ctx.log.debug(
     `embedded run tool start: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
+  );
+  toolStartTimes.set(toolCallId, Date.now());
+  ctx.log.info(
+    `tool_start: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
   );
 
   const shouldEmitToolEvents = ctx.shouldEmitToolResult();
@@ -216,9 +222,23 @@ export function handleToolExecutionEnd(
     },
   });
 
+  const startTime = toolStartTimes.get(toolCallId);
+  toolStartTimes.delete(toolCallId);
+  const durationMs = startTime != null ? Date.now() - startTime : undefined;
+  const durationSuffix = durationMs != null ? ` durationMs=${durationMs}` : "";
+
   ctx.log.debug(
     `embedded run tool end: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
   );
+  if (isToolError) {
+    ctx.log.info(
+      `tool_error: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}${durationSuffix}`,
+    );
+  } else {
+    ctx.log.info(
+      `tool_end: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}${durationSuffix}`,
+    );
+  }
 
   if (ctx.params.onToolResult && ctx.shouldEmitToolOutput()) {
     const outputText = extractToolResultText(sanitizedResult);
