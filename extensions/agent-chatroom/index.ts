@@ -27,11 +27,17 @@ import {
   type ReplyPayload,
   resolveDefaultAgentWorkspaceDir,
 } from "firstclaw/plugin-sdk";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
+
+/** Current inbox message being processed; used so dispatch_task can read rag_free from the triggering message (programmatic, no LLM). */
+const chatroomCurrentMessageStorage = new AsyncLocalStorage<{
+  currentInboxMessage: InboxMessage;
+}>();
 
 // ============================================================================
 // Types
@@ -2198,6 +2204,7 @@ function dispatchTask(
     maxRetries?: number;
     longRunning?: boolean;
     humanApprovalRequired?: boolean;
+    ragFree?: boolean;
     resumeStrategy?: ResumeStrategy;
   },
 ): TaskRecord {
@@ -2222,6 +2229,7 @@ function dispatchTask(
     agent_identity_token: identityToken,
     session_nonce: sessionNonce,
     human_approval_required: opts?.humanApprovalRequired ?? false,
+    rag_free: opts?.ragFree ?? false,
     resume_strategy: task.resume_strategy,
     // Orchestrator does not send expected_deliverables; Worker confirms deliverables in handshake.
   });
@@ -2567,6 +2575,17 @@ function classifyError(text: string): TaskErrorType {
     }
   }
   return "LLM_ERROR";
+}
+
+/** True for transient LLM output errors (e.g. truncated JSON) where one retry may succeed. */
+function isRetryableStepError(errMsg: string): boolean {
+  const lower = errMsg.toLowerCase();
+  return (
+    /unterminated string in json/i.test(errMsg) ||
+    /(?:unexpected end of|invalid) json/i.test(errMsg) ||
+    /json\.parse/i.test(errMsg) ||
+    (lower.includes("json") && (lower.includes("position") || lower.includes("syntax")))
+  );
 }
 
 // ============================================================================
@@ -3809,150 +3828,156 @@ async function autoDispatchMessage(
   config: any,
   logger: Logger,
 ): Promise<void> {
-  const channelId = msg.channel_id;
-  const isDM = channelId.startsWith("dm_");
+  await chatroomCurrentMessageStorage.run({ currentInboxMessage: msg }, async () => {
+    const channelId = msg.channel_id;
+    const isDM = channelId.startsWith("dm_");
 
-  // Hard gate: workers must not respond outside their DM channel
-  if (chatroomCfg.role !== "orchestrator") {
-    const myDM = `dm_${chatroomCfg.agentId}`;
-    if (channelId !== myDM) {
-      logger.info(
-        `[worker] Blocked LLM dispatch for #${channelId} — workers only respond in their DM`,
-      );
-      return;
-    }
-  }
-
-  const route = runtime.channel.routing.resolveAgentRoute({
-    cfg: config,
-    channel: "chatroom",
-    peer: { kind: isDM ? "direct" : "group", id: channelId },
-  });
-
-  const senderLabel = msg.from.startsWith("human:")
-    ? `[Human] ${msg.from.slice("human:".length)}`
-    : msg.from;
-
-  const currentMessageHumanApproval = msg.metadata?.human_approval_required === true;
-  const chatroomContext = buildChatroomContext(chatroomCfg, channelId, currentMessageHumanApproval);
-
-  // If this is a RESULT_REPORT to the orchestrator, add a review prompt
-  let messageBody: string;
-  if (msg.type === "RESULT_REPORT" && chatroomCfg.role === "orchestrator") {
-    const taskId = msg.metadata?.task_id as string | undefined;
-    const assetPaths = (msg.metadata?.asset_paths as string[] | undefined) ?? [];
-    const assetSection =
-      assetPaths.length > 0
-        ? `\nDelivered files:\n${assetPaths.map((p) => `  • ${p}`).join("\n")}`
-        : "\n(No files delivered)";
-
-    const taskRecord = taskId ? readTaskRecord(chatroomCfg, taskId) : null;
-    const agreed = taskRecord?.agreed_deliverables;
-    const reviewHint = agreed
-      ? `Review ONLY against the agreed deliverables (${agreed.items.map((i) => i.extension).join(", ")}). ` +
-        `If the worker delivered what they agreed (e.g. two .zip files), accept it. Do not reject based on your own assumptions (e.g. expecting .ipa/.apk). `
-      : `No agreed_deliverables on record; accept only if you are satisfied. `;
-
-    messageBody =
-      `[RESULT_REPORT from ${senderLabel}] Task ${taskId ?? "unknown"}${assetSection}\n\n` +
-      `${msg.content.text}\n\n` +
-      `⚠️ ACTION REQUIRED: ${reviewHint}` +
-      `Use chatroom_list_assets to verify files exist, then call chatroom_close_task(task_id="${taskId}", verdict="accepted") ` +
-      `to close, or verdict="rejected" with a comment to request rework.`;
-  } else {
-    messageBody = `[Chatroom #${channelId}] ${senderLabel}: ${msg.content.text}`;
-  }
-  const bodyForAgent = chatroomContext ? `${chatroomContext}\n${messageBody}` : messageBody;
-
-  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
-    Body: bodyForAgent,
-    BodyForAgent: bodyForAgent,
-    RawBody: msg.content.text,
-    CommandBody: msg.content.text,
-    From: `chatroom:${msg.from}`,
-    To: `chatroom:${chatroomCfg.agentId}`,
-    SessionKey: route.sessionKey,
-    AccountId: route.accountId,
-    ChatType: isDM ? "direct" : "group",
-    SenderName: senderLabel,
-    SenderId: msg.from,
-    Provider: "chatroom",
-    Surface: "chatroom",
-    MessageSid: msg.message_id,
-    Timestamp: Date.now(),
-    CommandAuthorized: true,
-  });
-
-  const prefixContext = createReplyPrefixContext({
-    cfg: config,
-    agentId: route.agentId,
-  });
-
-  // Write thinking state so the frontend can show a live "Thinking..." indicator
-  const thinkingFile = path.join(
-    chatroomCfg.nasRoot,
-    "chatroom",
-    "thinking",
-    `${chatroomCfg.agentId}.json`,
-  );
-  const updateThinking = (state: "thinking" | "tool" | "done", snippet?: string) => {
-    try {
-      ensureDir(path.dirname(thinkingFile));
-      writeJson(thinkingFile, {
-        agent_id: chatroomCfg.agentId,
-        channel_id: channelId,
-        message_id: msg.message_id,
-        state,
-        snippet: snippet?.slice(0, 500) ?? "",
-        updated_at: nowISO(),
-      });
-    } catch {
-      /* best effort */
-    }
-  };
-  updateThinking("thinking");
-
-  const dispatcherOptions = {
-    responsePrefix: prefixContext.responsePrefix,
-    responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
-    deliver: async (payload: ReplyPayload, info?: { kind: string }) => {
-      const text = payload.text ?? "";
-      const kind = info?.kind ?? "final";
-
-      if (kind === "block") {
-        updateThinking("thinking", text);
+    // Hard gate: workers must not respond outside their DM channel
+    if (chatroomCfg.role !== "orchestrator") {
+      const myDM = `dm_${chatroomCfg.agentId}`;
+      if (channelId !== myDM) {
+        logger.info(
+          `[worker] Blocked LLM dispatch for #${channelId} — workers only respond in their DM`,
+        );
         return;
       }
-      if (kind === "tool") {
-        const toolName = (payload as any).toolName ?? "tool";
-        updateThinking("tool", `Using ${toolName}...`);
-        return;
-      }
+    }
 
-      // kind === "final"
-      updateThinking("done");
-      if (!text.trim()) return;
+    const route = runtime.channel.routing.resolveAgentRoute({
+      cfg: config,
+      channel: "chatroom",
+      peer: { kind: isDM ? "direct" : "group", id: channelId },
+    });
+
+    const senderLabel = msg.from.startsWith("human:")
+      ? `[Human] ${msg.from.slice("human:".length)}`
+      : msg.from;
+
+    const currentMessageHumanApproval = msg.metadata?.human_approval_required === true;
+    const chatroomContext = buildChatroomContext(
+      chatroomCfg,
+      channelId,
+      currentMessageHumanApproval,
+    );
+
+    // If this is a RESULT_REPORT to the orchestrator, add a review prompt
+    let messageBody: string;
+    if (msg.type === "RESULT_REPORT" && chatroomCfg.role === "orchestrator") {
+      const taskId = msg.metadata?.task_id as string | undefined;
+      const assetPaths = (msg.metadata?.asset_paths as string[] | undefined) ?? [];
+      const assetSection =
+        assetPaths.length > 0
+          ? `\nDelivered files:\n${assetPaths.map((p) => `  • ${p}`).join("\n")}`
+          : "\n(No files delivered)";
+
+      const taskRecord = taskId ? readTaskRecord(chatroomCfg, taskId) : null;
+      const agreed = taskRecord?.agreed_deliverables;
+      const reviewHint = agreed
+        ? `Review ONLY against the agreed deliverables (${agreed.items.map((i) => i.extension).join(", ")}). ` +
+          `If the worker delivered what they agreed (e.g. two .zip files), accept it. Do not reject based on your own assumptions (e.g. expecting .ipa/.apk). `
+        : `No agreed_deliverables on record; accept only if you are satisfied. `;
+
+      messageBody =
+        `[RESULT_REPORT from ${senderLabel}] Task ${taskId ?? "unknown"}${assetSection}\n\n` +
+        `${msg.content.text}\n\n` +
+        `⚠️ ACTION REQUIRED: ${reviewHint}` +
+        `Use chatroom_list_assets to verify files exist, then call chatroom_close_task(task_id="${taskId}", verdict="accepted") ` +
+        `to close, or verdict="rejected" with a comment to request rework.`;
+    } else {
+      messageBody = `[Chatroom #${channelId}] ${senderLabel}: ${msg.content.text}`;
+    }
+    const bodyForAgent = chatroomContext ? `${chatroomContext}\n${messageBody}` : messageBody;
+
+    const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+      Body: bodyForAgent,
+      BodyForAgent: bodyForAgent,
+      RawBody: msg.content.text,
+      CommandBody: msg.content.text,
+      From: `chatroom:${msg.from}`,
+      To: `chatroom:${chatroomCfg.agentId}`,
+      SessionKey: route.sessionKey,
+      AccountId: route.accountId,
+      ChatType: isDM ? "direct" : "group",
+      SenderName: senderLabel,
+      SenderId: msg.from,
+      Provider: "chatroom",
+      Surface: "chatroom",
+      MessageSid: msg.message_id,
+      Timestamp: Date.now(),
+      CommandAuthorized: true,
+    });
+
+    const prefixContext = createReplyPrefixContext({
+      cfg: config,
+      agentId: route.agentId,
+    });
+
+    // Write thinking state so the frontend can show a live "Thinking..." indicator
+    const thinkingFile = path.join(
+      chatroomCfg.nasRoot,
+      "chatroom",
+      "thinking",
+      `${chatroomCfg.agentId}.json`,
+    );
+    const updateThinking = (state: "thinking" | "tool" | "done", snippet?: string) => {
       try {
-        const inlineMentions = parseAtMentions(text);
-        const result = sendMessageToNAS(chatroomCfg, channelId, text, "CHAT", inlineMentions);
-        logger.info(`Auto-reply → #${channelId} (seq: ${result.seq})`);
-      } catch (err) {
-        logger.error(`Failed to send auto-reply to ${channelId}: ${err}`);
+        ensureDir(path.dirname(thinkingFile));
+        writeJson(thinkingFile, {
+          agent_id: chatroomCfg.agentId,
+          channel_id: channelId,
+          message_id: msg.message_id,
+          state,
+          snippet: snippet?.slice(0, 500) ?? "",
+          updated_at: nowISO(),
+        });
+      } catch {
+        /* best effort */
       }
-    },
-    onError: (err: any, info: any) => {
-      updateThinking("done");
-      logger.error(`Dispatch error (${info?.kind}): ${err}`);
-    },
-  };
+    };
+    updateThinking("thinking");
 
-  logger.info(`Dispatching chat from ${msg.from} in #${channelId} to LLM`);
+    const dispatcherOptions = {
+      responsePrefix: prefixContext.responsePrefix,
+      responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
+      deliver: async (payload: ReplyPayload, info?: { kind: string }) => {
+        const text = payload.text ?? "";
+        const kind = info?.kind ?? "final";
 
-  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg: config,
-    dispatcherOptions,
-    replyOptions: { onModelSelected: prefixContext.onModelSelected },
+        if (kind === "block") {
+          updateThinking("thinking", text);
+          return;
+        }
+        if (kind === "tool") {
+          const toolName = (payload as any).toolName ?? "tool";
+          updateThinking("tool", `Using ${toolName}...`);
+          return;
+        }
+
+        // kind === "final"
+        updateThinking("done");
+        if (!text.trim()) return;
+        try {
+          const inlineMentions = parseAtMentions(text);
+          const result = sendMessageToNAS(chatroomCfg, channelId, text, "CHAT", inlineMentions);
+          logger.info(`Auto-reply → #${channelId} (seq: ${result.seq})`);
+        } catch (err) {
+          logger.error(`Failed to send auto-reply to ${channelId}: ${err}`);
+        }
+      },
+      onError: (err: any, info: any) => {
+        updateThinking("done");
+        logger.error(`Dispatch error (${info?.kind}): ${err}`);
+      },
+    };
+
+    logger.info(`Dispatching chat from ${msg.from} in #${channelId} to LLM`);
+
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: config,
+      dispatcherOptions,
+      replyOptions: { onModelSelected: prefixContext.onModelSelected },
+    });
   });
 }
 
@@ -4426,6 +4451,39 @@ async function stepExecutionLoop(
         output_files: [],
         error_detail: `Unhandled error during step execution: ${errMsg}`,
       };
+    }
+
+    // Retry once on retryable LLM/output errors (e.g. Unterminated string in JSON)
+    if (!result.success && result.error_detail && isRetryableStepError(result.error_detail)) {
+      logger.info(
+        `Step ${step.order} retrying once after retryable error: ${result.error_detail.slice(0, 100)}`,
+      );
+      appendTaskProgress(chatroomCfg, taskId, {
+        phase: `step_${step.order}_retry`,
+        detail: `Retrying after: ${result.error_detail.slice(0, 80)}`,
+      });
+      try {
+        result = await executeStep(
+          chatroomCfg,
+          plan,
+          step,
+          taskId,
+          outputDir as string,
+          previousResults,
+          msg,
+          runtime,
+          config,
+          logger,
+        );
+      } catch (retryErr: any) {
+        const retryMsg = retryErr?.message ?? String(retryErr);
+        result = {
+          success: false,
+          result_summary: "",
+          output_files: [],
+          error_detail: `Retry failed: ${retryMsg}. Original: ${result.error_detail}`,
+        };
+      }
     }
 
     updateTaskRecord(chatroomCfg, taskId, {
@@ -5113,6 +5171,9 @@ const agentChatroomPlugin = {
                 resume_strategy?: ResumeStrategy;
                 human_approval_required?: boolean;
               };
+              // rag_free is set programmatically from the message that triggered this dispatch (no LLM parameter)
+              const currentMsg = chatroomCurrentMessageStorage.getStore()?.currentInboxMessage;
+              const ragFree = currentMsg?.metadata?.rag_free === true;
               const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
               let instruction = p.instruction;
               if (p.long_running) {
@@ -5127,6 +5188,7 @@ const agentChatroomPlugin = {
                 longRunning: p.long_running,
                 resumeStrategy: p.resume_strategy,
                 humanApprovalRequired: p.human_approval_required === true,
+                ragFree,
               });
               return {
                 content: [
