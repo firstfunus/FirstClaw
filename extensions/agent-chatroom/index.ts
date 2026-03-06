@@ -31,7 +31,16 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
+import {
+  readFile,
+  readdir,
+  writeFile,
+  mkdir,
+  unlink,
+  stat,
+  access,
+  copyFile,
+} from "node:fs/promises";
 import * as path from "node:path";
 
 /** Current inbox message being processed; used so dispatch_task can read rag_free from the triggering message (programmatic, no LLM). */
@@ -309,8 +318,16 @@ function writeJson(filePath: string, data: any): void {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
 }
 
+async function writeJsonAsync(filePath: string, data: any): Promise<void> {
+  await writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
+}
+
 function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+async function ensureDirAsync(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
 }
 
 function randomUUID(): string {
@@ -421,6 +438,29 @@ function updatePlanStep(
   if (!plan) return null;
   plan.steps = plan.steps.map((s) => (s.step_id === stepId ? { ...s, ...patch } : s));
   writePlan(cfg, plan);
+  return plan;
+}
+
+async function readPlanAsync(cfg: ChatroomConfig, taskId: string): Promise<TaskPlan | null> {
+  return readJsonAsync(path.join(plansDir(cfg), `${taskId}.json`));
+}
+
+async function writePlanAsync(cfg: ChatroomConfig, plan: TaskPlan): Promise<void> {
+  const dir = plansDir(cfg);
+  await ensureDirAsync(dir);
+  await writeJsonAsync(path.join(dir, `${plan.task_id}.json`), plan);
+}
+
+async function updatePlanStepAsync(
+  cfg: ChatroomConfig,
+  taskId: string,
+  stepId: string,
+  patch: Partial<PlanStep>,
+): Promise<TaskPlan | null> {
+  const plan = await readPlanAsync(cfg, taskId);
+  if (!plan) return null;
+  plan.steps = plan.steps.map((s) => (s.step_id === stepId ? { ...s, ...patch } : s));
+  await writePlanAsync(cfg, plan);
   return plan;
 }
 
@@ -1546,6 +1586,15 @@ function updateHeartbeat(cfg: ChatroomConfig): void {
   writeJson(regPath, info);
 }
 
+async function updateHeartbeatAsync(cfg: ChatroomConfig): Promise<void> {
+  const regPath = path.join(chatroomRoot(cfg), "registry", `${cfg.agentId}.json`);
+  const info = await readJsonAsync(regPath);
+  if (!info) return;
+  info.last_heartbeat = nowISO();
+  if (info.status === "offline") info.status = "idle";
+  await writeJsonAsync(regPath, info);
+}
+
 // ============================================================================
 // Self-update: git pull → exit(42) → run-node.mjs handles install + build + relaunch
 // ============================================================================
@@ -1745,11 +1794,11 @@ function handleSurvivalCheck(cfg: ChatroomConfig, msg: InboxMessage, logger: Log
   sendMessageToNAS(cfg, channelId, text, "STATUS_UPDATE");
 }
 
-function pauseActiveTasksForUpgrade(cfg: ChatroomConfig, logger: Logger): number {
-  const activeTasks = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING");
+async function pauseActiveTasksForUpgrade(cfg: ChatroomConfig, logger: Logger): Promise<number> {
+  const activeTasks = await listTasksByStatusAsync(cfg, "DISPATCHED", "ACKED", "PROCESSING");
   const myTasks = activeTasks.filter((t) => t.to === cfg.agentId || t.from === cfg.agentId);
   for (const task of myTasks) {
-    updateTaskRecord(cfg, task.task_id, {
+    await updateTaskRecordAsync(cfg, task.task_id, {
       status: "PARKED",
       current_phase: "system_upgrade",
     } as Partial<TaskRecord>);
@@ -1835,7 +1884,7 @@ async function handleSelfUpdate(
     }
 
     // ── Step 2: pause tasks ──
-    const parkedCount = pauseActiveTasksForUpgrade(cfg, logger);
+    const parkedCount = await pauseActiveTasksForUpgrade(cfg, logger);
     const parkedNote = parkedCount > 0 ? ` (${parkedCount} active task(s) parked)` : "";
 
     // ── Step 3: install + build (safe while gateway runs — modules cached in memory) ──
@@ -2027,6 +2076,128 @@ function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
   return messages;
 }
 
+async function pollInboxAsync(cfg: ChatroomConfig, logger?: Logger): Promise<InboxMessage[]> {
+  const root = chatroomRoot(cfg);
+  const inboxDir = path.join(root, "inbox", cfg.agentId);
+  try {
+    await access(inboxDir);
+  } catch {
+    return [];
+  }
+
+  const allFiles = await readdir(inboxDir);
+  const files = allFiles.filter((f) => f.endsWith(".json")).sort();
+  const messages: InboxMessage[] = [];
+
+  for (const file of files) {
+    const filePath = path.join(inboxDir, file);
+    try {
+      const notif = await readJsonAsync(filePath);
+      if (!notif) {
+        logger?.warn(`[pollInbox] Unreadable notification (null JSON): ${file}`);
+        try {
+          await unlink(filePath);
+        } catch {
+          /* best-effort cleanup */
+        }
+        continue;
+      }
+
+      let resolved = false;
+
+      if (notif.message_seq && notif.message_seq > 0) {
+        const msgDir = path.join(root, "channels", notif.channel_id, "messages");
+        try {
+          await access(msgDir);
+          const allMsgFiles = await readdir(msgDir);
+          const prefix = String(notif.message_seq).padStart(6, "0");
+          const msgFiles = allMsgFiles.filter((f) => f.startsWith(prefix));
+          if (msgFiles.length > 0) {
+            const fullMsg = await readJsonAsync(path.join(msgDir, msgFiles[0]));
+            if (fullMsg) {
+              messages.push(fullMsg);
+              resolved = true;
+            }
+          }
+        } catch {
+          /* msgDir does not exist */
+        }
+      }
+
+      if (!resolved && notif.retry_for_task) {
+        const taskPath = path.join(tasksDir(cfg), `${notif.retry_for_task}.json`);
+        const taskData = await readJsonAsync(taskPath);
+        if (taskData) {
+          messages.push({
+            message_id: notif.notification_id ?? randomUUID(),
+            channel_id: notif.channel_id,
+            from: notif.from ?? taskData.from,
+            type: "TASK_DISPATCH",
+            content: {
+              text: taskData.instruction ?? notif.preview ?? "",
+              mentions: [cfg.agentId],
+            },
+            timestamp: notif.timestamp ?? nowISO(),
+            seq: 0,
+            metadata: {
+              task_id: notif.retry_for_task,
+              priority: "urgent",
+              output_dir: taskData.asset_paths?.[0]
+                ? toChatroomUri(
+                    path.dirname(
+                      isChatroomUri(taskData.asset_paths[0])
+                        ? fromChatroomUri(taskData.asset_paths[0], cfg)
+                        : fromNasRelativePath(cfg, taskData.asset_paths[0]),
+                    ),
+                    cfg,
+                  )
+                : toChatroomUri(taskAssetsDir(cfg, cfg.agentId, notif.retry_for_task), cfg),
+              is_retry: true,
+            },
+          });
+          resolved = true;
+        } else {
+          const tasksDirAbs = path.resolve(tasksDir(cfg));
+          logger?.warn(
+            `[pollInbox] Retry notification for task ${notif.retry_for_task} could not resolve: task file not found. ` +
+              `Attempted path: ${path.resolve(taskPath)}. Worker tasksDir: ${tasksDirAbs}. ` +
+              "Ensure orchestrator and worker share the same NAS root (tasks dir). Leaving notification file for retry.",
+          );
+          continue;
+        }
+      }
+
+      if (!resolved && notif.preview) {
+        messages.push({
+          message_id: notif.notification_id ?? randomUUID(),
+          channel_id: notif.channel_id,
+          from: notif.from ?? "unknown",
+          type: "CHAT",
+          content: {
+            text: notif.preview,
+            mentions: notif.mentioned ? [cfg.agentId] : [],
+          },
+          timestamp: notif.timestamp ?? nowISO(),
+          seq: notif.message_seq ?? 0,
+          metadata: {},
+        });
+      }
+
+      if (!resolved) {
+        logger?.warn(
+          `[pollInbox] Could not resolve notification ${file} (ch=${notif.channel_id}, seq=${notif.message_seq}) — skipping`,
+        );
+      }
+
+      await unlink(filePath);
+    } catch (err) {
+      logger?.error(`[pollInbox] Error processing ${file}: ${err}`);
+    }
+  }
+
+  return messages;
+}
+
 // ============================================================================
 // Worker task queue — serialize TASK_DISPATCH so only one task runs at a time
 // ============================================================================
@@ -2169,6 +2340,201 @@ async function listTasksByStatusAsync(
     if (task && statusSet.has(task.status)) tasks.push(task);
   }
   return tasks;
+}
+
+async function readTaskRecordAsync(
+  cfg: ChatroomConfig,
+  taskId: string,
+): Promise<TaskRecord | null> {
+  return readJsonAsync(path.join(tasksDir(cfg), `${taskId}.json`));
+}
+
+async function updateTaskRecordAsync(
+  cfg: ChatroomConfig,
+  taskId: string,
+  patch: Partial<TaskRecord>,
+): Promise<void> {
+  const filePath = path.join(tasksDir(cfg), `${taskId}.json`);
+
+  if (!isNasOnline()) {
+    const staged = stagedPathFor(cfg, toChatroomUri(filePath, cfg));
+    await ensureDirAsync(path.dirname(staged));
+    await writeFile(staged, JSON.stringify(patch, null, 2), "utf-8");
+    appendWal(cfg, {
+      op: "TASK_UPDATE",
+      localPath: staged,
+      nasPath: toChatroomUri(filePath, cfg),
+      metadata: { task_id: taskId },
+    });
+    return;
+  }
+
+  const existing = await readJsonAsync(filePath);
+  if (!existing) return;
+  await writeJsonAsync(filePath, { ...existing, ...patch });
+}
+
+async function setAgentWorkingAsync(
+  cfg: ChatroomConfig,
+  agentId: string,
+  taskId: string,
+  logger: Logger,
+): Promise<void> {
+  const regPath = path.join(chatroomRoot(cfg), "registry", `${agentId}.json`);
+  const info = await readJsonAsync(regPath);
+  if (!info) return;
+  info.status = "working";
+  info.current_task = taskId;
+  info.last_heartbeat = nowISO();
+  await writeJsonAsync(regPath, info);
+  logger.info(`Agent ${agentId} status → working (task: ${taskId.slice(0, 8)})`);
+}
+
+async function resetAgentStatusAsync(
+  cfg: ChatroomConfig,
+  agentId: string,
+  logger: Logger,
+): Promise<void> {
+  const regPath = path.join(chatroomRoot(cfg), "registry", `${agentId}.json`);
+  const info = await readJsonAsync(regPath);
+  if (!info) return;
+  if (info.status === "working" || info.status === "waiting") {
+    info.status = "idle";
+    info.current_task = null;
+    await writeJsonAsync(regPath, info);
+    logger.info(`Reset ${agentId} status to idle`);
+  }
+}
+
+async function validateDeliveryForAcceptanceAsync(
+  cfg: ChatroomConfig,
+  task: TaskRecord,
+  _logger: Logger,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const errType = task.error_type;
+  if (errType === "CONTEXT_OVERFLOW" || errType === "RATE_LIMITED") {
+    return {
+      ok: false,
+      reason: `Task ended with error (${errType}). Cannot accept; treat as failed. Worker should have reported FAILED, not DELIVERED.`,
+    };
+  }
+  const agreed = task.agreed_deliverables;
+  if (!agreed?.items?.length) {
+    return {
+      ok: false,
+      reason:
+        "No agreed deliverables on this task. The worker must call chatroom_confirm_deliverables before planning; acceptance cannot proceed without an agreement.",
+    };
+  }
+  const paths = task.asset_paths ?? [];
+  if (paths.length === 0) {
+    return {
+      ok: false,
+      reason: "No files delivered. The worker must attach the agreed deliverables.",
+    };
+  }
+  const expectedByExt = new Map<string, number>();
+  for (const item of agreed.items) {
+    const ext = item.extension.startsWith(".")
+      ? item.extension.toLowerCase()
+      : `.${item.extension}`.toLowerCase();
+    expectedByExt.set(ext, (expectedByExt.get(ext) ?? 0) + 1);
+  }
+  const deliveredByExt = new Map<string, string[]>();
+  for (const uri of paths) {
+    const ext = path.extname(uri).toLowerCase();
+    if (!deliveredByExt.has(ext)) deliveredByExt.set(ext, []);
+    deliveredByExt.get(ext)!.push(uri);
+  }
+  for (const [ext, count] of expectedByExt) {
+    const list = deliveredByExt.get(ext) ?? [];
+    if (list.length !== count) {
+      return {
+        ok: false,
+        reason: `Agreed deliverables require exactly ${count} file(s) with extension ${ext}, but ${list.length} delivered.`,
+      };
+    }
+  }
+  for (const ext of deliveredByExt.keys()) {
+    if (!expectedByExt.has(ext)) {
+      return {
+        ok: false,
+        reason: `Delivered file(s) with extension ${ext} were not in the agreed deliverables.`,
+      };
+    }
+  }
+  for (const uri of paths) {
+    try {
+      const localPath = fromChatroomUri(uri, cfg);
+      try {
+        await access(localPath);
+      } catch {
+        return { ok: false, reason: `File not found: ${uri} (resolved to ${localPath}).` };
+      }
+      const s = await stat(localPath);
+      if (!s.isFile() || s.size <= 0) {
+        return { ok: false, reason: `File empty or not a file: ${uri}.` };
+      }
+    } catch (err) {
+      return { ok: false, reason: `Cannot validate file ${uri}: ${err}.` };
+    }
+  }
+  return { ok: true };
+}
+
+async function cancelTaskAsync(
+  cfg: ChatroomConfig,
+  taskId: string,
+  reason: string,
+  logger: Logger,
+): Promise<TaskRecord | null> {
+  const task = await readTaskRecordAsync(cfg, taskId);
+  if (!task) return null;
+
+  const terminalStatuses: TaskStatus[] = ["DONE", "FAILED", "ABANDONED", "CANCELLED"];
+  if (terminalStatuses.includes(task.status)) return task;
+
+  await updateTaskRecordAsync(cfg, taskId, {
+    status: "CANCELLED",
+    completed_at: nowISO(),
+    result_summary: `Cancelled: ${reason}`.slice(0, 500),
+  });
+
+  sendMessageToNAS(
+    cfg,
+    task.channel_id,
+    `[SYSTEM] Task ${taskId} cancelled by ${cfg.agentId}. Reason: ${reason}`,
+    "SYSTEM",
+    [task.to],
+    undefined,
+    { task_id: taskId, status: "CANCELLED" },
+  );
+
+  await resetAgentStatusAsync(cfg, task.to, logger);
+  logger.info(`Task ${taskId} cancelled (was ${task.status}) → ${task.to}`);
+  return { ...task, status: "CANCELLED", completed_at: nowISO() };
+}
+
+async function readAllowlistAsync(cfg: ChatroomConfig): Promise<{
+  patterns: Array<{ pattern: string; added_by: string; added_at: string }>;
+}> {
+  const data = await readJsonAsync(permissionAllowlistPath(cfg));
+  return data?.patterns ? data : { patterns: [] };
+}
+
+async function writeParkedTaskAsync(cfg: ChatroomConfig, info: ParkedTaskInfo): Promise<void> {
+  const dir = parkedTasksDir(cfg);
+  await ensureDirAsync(dir);
+  await writeJsonAsync(path.join(dir, `${info.task_id}.json`), info);
+}
+
+async function removeParkedTaskAsync(cfg: ChatroomConfig, taskId: string): Promise<void> {
+  const filePath = path.join(parkedTasksDir(cfg), `${taskId}.json`);
+  try {
+    await unlink(filePath);
+  } catch {
+    /* ignore */
+  }
 }
 
 // ============================================================================
@@ -2390,7 +2756,7 @@ function filterDeliverables(
   return { deliverables, intermediates };
 }
 
-function sendTaskResult(
+async function sendTaskResult(
   cfg: ChatroomConfig,
   taskId: string,
   resultText: string,
@@ -2398,23 +2764,20 @@ function sendTaskResult(
   logger: Logger,
   assetPaths: string[] = [],
   errorType?: TaskErrorType | null,
-): void {
+): Promise<void> {
   finalizeTaskProgress(cfg, taskId);
 
-  const task = readTaskRecord(cfg, taskId);
+  const task = await readTaskRecordAsync(cfg, taskId);
   if (!task) {
     logger.warn(`Cannot send result — task ${taskId} not found`);
     return;
   }
 
-  // Programmatic filter: use agreed_deliverables when set, else legacy expected_deliverables, else all
   const { deliverables } = filterDeliverables(assetPaths, task, logger, taskId);
   const uriAssetPaths = deliverables.map((p) => toChatroomUri(p, cfg));
 
-  // Workers send DELIVERED (not DONE). Only the orchestrator can close a task after review.
   const reportStatus = status === "DONE" ? "DELIVERED" : status;
 
-  // Append file listing to result text so it's always visible
   let enrichedText = resultText;
   if (uriAssetPaths.length > 0) {
     enrichedText +=
@@ -2437,13 +2800,12 @@ function sendTaskResult(
   if (errorType) {
     patch.error_type = errorType;
   }
-  // Always persist failure detail for debugging (frontend shows this in Failed task modal)
   if (status === "FAILED") {
     patch.error_detail = resultText.slice(0, 2000);
   }
   patch.current_phase = status === "FAILED" ? "failed" : "delivered";
-  updateTaskRecord(cfg, taskId, patch);
-  resetAgentStatus(cfg, task.to, logger);
+  await updateTaskRecordAsync(cfg, taskId, patch);
+  await resetAgentStatusAsync(cfg, task.to, logger);
   logger.info(
     `Result DELIVERED for task ${taskId} (${reportStatus}${errorType ? ` [${errorType}]` : ""}) → ${task.from}`,
   );
@@ -2670,6 +3032,23 @@ function _flushProgress(cfg: ChatroomConfig, taskId: string): void {
   buf.entries = [];
 }
 
+async function _flushProgressAsync(cfg: ChatroomConfig, taskId: string): Promise<void> {
+  const buf = _progressBuffers.get(taskId);
+  if (!buf || buf.entries.length === 0) return;
+
+  const task = await readTaskRecordAsync(cfg, taskId);
+  if (!task) return;
+
+  const existing = task.progress_log ?? [];
+  const merged = [...existing, ...buf.entries];
+  await updateTaskRecordAsync(cfg, taskId, {
+    progress_log: merged,
+    current_phase: buf.phase,
+  } as Partial<TaskRecord>);
+
+  buf.entries = [];
+}
+
 function appendTaskProgress(
   cfg: ChatroomConfig,
   taskId: string,
@@ -2685,7 +3064,7 @@ function appendTaskProgress(
 
   if (!buf.flushTimer) {
     buf.flushTimer = setTimeout(() => {
-      _flushProgress(cfg, taskId);
+      void _flushProgressAsync(cfg, taskId);
       buf!.flushTimer = null;
     }, PROGRESS_FLUSH_INTERVAL_MS);
   }
@@ -3082,7 +3461,7 @@ async function monitorParkedTasks(
                 }
               }
               updatePlan(cfg, info.task_id, { status: "FAILED", completed_at: nowISO() });
-              sendTaskResult(
+              await sendTaskResult(
                 cfg,
                 info.task_id,
                 `Plan failed at step ${parkedStep.order} (${parkedStep.title}): ${errDetail}`,
@@ -3104,7 +3483,7 @@ async function monitorParkedTasks(
               const allResults = previousResults
                 .map((r, i) => `Step ${i + 1} (${r.title}): ${r.result}`)
                 .join("\n");
-              sendTaskResult(
+              await sendTaskResult(
                 cfg,
                 info.task_id,
                 `Plan completed: ${plan.summary}\n\n${allResults}`,
@@ -3134,7 +3513,7 @@ async function monitorParkedTasks(
             );
           } catch (err) {
             logger.error(`Error resuming plan task ${info.task_id}: ${err}`);
-            sendTaskResult(cfg, info.task_id, `Plan resume failed: ${err}`, "FAILED", logger);
+            await sendTaskResult(cfg, info.task_id, `Plan resume failed: ${err}`, "FAILED", logger);
           }
         })();
 
@@ -3342,7 +3721,7 @@ async function handleIncomingTaskAsync(
     }
   } catch (err) {
     logger.error(`Unhandled error for task ${taskId}: ${err}`);
-    sendTaskResult(cfg, taskId, `Task crashed: ${err}`, "FAILED", logger);
+    await sendTaskResult(cfg, taskId, `Task crashed: ${err}`, "FAILED", logger);
   }
 }
 
@@ -3388,7 +3767,7 @@ async function handlePlanModeTask(
           existingTask.status !== "CANCELLED" &&
           existingTask.status !== "FAILED"
         ) {
-          sendTaskResult(
+          await sendTaskResult(
             cfg,
             taskId,
             "Plan was rejected or human approval timed out",
@@ -3421,19 +3800,22 @@ async function handlePlanModeTask(
     await stepExecutionLoop(cfg, approvedPlan, msg, taskId, runtime, config, logger);
   } catch (err) {
     logger.error(`Plan mode error for task ${taskId}: ${err}`);
-    sendTaskResult(cfg, taskId, `Plan mode failed: ${err}`, "FAILED", logger);
+    await sendTaskResult(cfg, taskId, `Plan mode failed: ${err}`, "FAILED", logger);
   }
 }
 
-function handleTaskAck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
+async function handleTaskAck(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  logger: Logger,
+): Promise<void> {
   const taskId = msg.metadata?.task_id;
   if (!taskId) return;
 
-  const task = readTaskRecord(cfg, taskId);
+  const task = await readTaskRecordAsync(cfg, taskId);
   if (!task) return;
 
   if (task.status === "DISPATCHED" || task.status === "TIMEOUT" || task.status === "RETRYING") {
-    // TCP-style: verify echoed identity token from the worker
     const echoedToken = msg.metadata?.agent_identity_token as string | undefined;
     const storedToken = (task as any).identity_token as string | undefined;
     if (storedToken && echoedToken && storedToken !== echoedToken) {
@@ -3443,7 +3825,7 @@ function handleTaskAck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): 
       return;
     }
 
-    updateTaskRecord(cfg, taskId, {
+    await updateTaskRecordAsync(cfg, taskId, {
       status: "ACKED",
       acked_at: nowISO(),
       current_phase: "acked",
@@ -3469,7 +3851,11 @@ function handleTaskAck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): 
   }
 }
 
-function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
+async function handleTaskResult(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  logger: Logger,
+): Promise<void> {
   const taskId = msg.metadata?.task_id;
   if (!taskId) return;
 
@@ -3478,13 +3864,12 @@ function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger
     return;
   }
 
-  const task = readTaskRecord(cfg, taskId);
+  const task = await readTaskRecordAsync(cfg, taskId);
   if (!task) return;
 
   const reportStatus = (msg.metadata?.status as TaskStatus) || "DELIVERED";
   const assetPaths = (msg.metadata?.asset_paths as string[]) ?? [];
 
-  // Task stays DELIVERED until orchestrator explicitly closes it
   const patch: Partial<TaskRecord> = {
     status: reportStatus === "FAILED" ? "FAILED" : "DELIVERED",
     result_summary: msg.content.text.slice(0, 500),
@@ -3498,7 +3883,7 @@ function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger
     patch.error_detail = msg.content.text.slice(0, 2000);
   }
   patch.current_phase = reportStatus === "FAILED" ? "failed" : "delivered";
-  updateTaskRecord(cfg, taskId, patch);
+  await updateTaskRecordAsync(cfg, taskId, patch);
   logger.info(
     `Task ${taskId} result DELIVERED from ${msg.from} (${reportStatus}${patch.error_type ? ` [${patch.error_type}]` : ""}) — awaiting orchestrator review`,
   );
@@ -4872,7 +5257,7 @@ async function stepExecutionLoop(
 
       const allFiles = scanOutputDir(outputDir as string);
       const errSummary = `Plan failed at step ${step.order}/${plan.steps.length} (${step.title}): ${errDetail}`;
-      sendTaskResult(chatroomCfg, taskId, errSummary, "FAILED", logger, allFiles);
+      await sendTaskResult(chatroomCfg, taskId, errSummary, "FAILED", logger, allFiles);
       return;
     }
   }
@@ -4907,7 +5292,7 @@ async function stepExecutionLoop(
     ``,
     ...previousResults.map((r, i) => `Step ${i + 1} (${r.title}): ${r.result}`),
   ].join("\n");
-  sendTaskResult(chatroomCfg, taskId, resultSummary, "DONE", logger, allFiles);
+  await sendTaskResult(chatroomCfg, taskId, resultSummary, "DONE", logger, allFiles);
 }
 
 /**
@@ -5377,7 +5762,7 @@ async function autoDispatchForTask(
               note: "Legacy task run (no plan).",
             },
           } as Partial<TaskRecord>);
-          sendTaskResult(chatroomCfg, taskId, text, "FAILED", logger, [], errType);
+          await sendTaskResult(chatroomCfg, taskId, text, "FAILED", logger, [], errType);
           return;
         }
 
@@ -5389,7 +5774,7 @@ async function autoDispatchForTask(
           },
         } as Partial<TaskRecord>);
         const producedFiles = scanOutputDir(outputDir as string);
-        sendTaskResult(chatroomCfg, taskId, text, "DONE", logger, producedFiles);
+        await sendTaskResult(chatroomCfg, taskId, text, "DONE", logger, producedFiles);
       } catch (err) {
         logger.error(`Failed to send task result for ${taskId}: ${err}`);
       }
@@ -5409,7 +5794,7 @@ async function autoDispatchForTask(
             note: `Legacy task run error [${errType}].`,
           },
         } as Partial<TaskRecord>);
-        sendTaskResult(chatroomCfg, taskId, errText, "FAILED", logger, [], errType);
+        void sendTaskResult(chatroomCfg, taskId, errText, "FAILED", logger, [], errType);
       } catch {
         /* ignore */
       }
@@ -5640,7 +6025,7 @@ const agentChatroomPlugin = {
                   verdict: "accepted" | "rejected";
                   comment?: string;
                 };
-                const task = readTaskRecord(cfg, p.task_id);
+                const task = await readTaskRecordAsync(cfg, p.task_id);
                 if (!task) {
                   return {
                     content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
@@ -5660,7 +6045,7 @@ const agentChatroomPlugin = {
                 }
 
                 if (p.verdict === "accepted") {
-                  const validation = validateDeliveryForAcceptance(cfg, task, logger);
+                  const validation = await validateDeliveryForAcceptanceAsync(cfg, task, logger);
                   if (!validation.ok) {
                     return {
                       content: [
@@ -5672,7 +6057,7 @@ const agentChatroomPlugin = {
                       details: undefined,
                     };
                   }
-                  updateTaskRecord(cfg, p.task_id, {
+                  await updateTaskRecordAsync(cfg, p.task_id, {
                     status: "DONE",
                     completed_at: nowISO(),
                     current_phase: "completed",
@@ -5707,7 +6092,7 @@ const agentChatroomPlugin = {
                     details: { task_id: p.task_id, status: "DONE" },
                   };
                 } else {
-                  updateTaskRecord(cfg, p.task_id, {
+                  await updateTaskRecordAsync(cfg, p.task_id, {
                     status: "PROCESSING",
                     current_phase: "rework",
                   });
@@ -5768,7 +6153,7 @@ const agentChatroomPlugin = {
             try {
               const p = params as { task_id?: string };
               if (p.task_id) {
-                const task = readTaskRecord(cfg, p.task_id);
+                const task = await readTaskRecordAsync(cfg, p.task_id);
                 if (!task)
                   return {
                     content: [{ type: "text" as const, text: `Task ${p.task_id} not found` }],
@@ -5779,7 +6164,13 @@ const agentChatroomPlugin = {
                   details: task,
                 };
               }
-              const active = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING", "TIMEOUT");
+              const active = await listTasksByStatusAsync(
+                cfg,
+                "DISPATCHED",
+                "ACKED",
+                "PROCESSING",
+                "TIMEOUT",
+              );
               if (active.length === 0)
                 return {
                   content: [{ type: "text" as const, text: "No active tasks." }],
@@ -5835,7 +6226,7 @@ const agentChatroomPlugin = {
             try {
               const p = params as { task_id: string; reason?: string };
               const reason = p.reason ?? "Cancelled by orchestrator";
-              const result = cancelTask(cfg, p.task_id, reason, logger);
+              const result = await cancelTaskAsync(cfg, p.task_id, reason, logger);
               if (!result) {
                 return {
                   content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
@@ -6009,16 +6400,18 @@ const agentChatroomPlugin = {
             try {
               const p = params as { status?: string };
               const dir = plansDir(cfg);
-              if (!fs.existsSync(dir)) {
+              try {
+                await access(dir);
+              } catch {
                 return {
                   content: [{ type: "text" as const, text: "No plans found." }],
                   details: [],
                 };
               }
               let plans: TaskPlan[] = [];
-              for (const f of fs.readdirSync(dir)) {
+              for (const f of await readdir(dir)) {
                 if (!f.endsWith(".json")) continue;
-                const plan = readJson(path.join(dir, f)) as TaskPlan | null;
+                const plan = (await readJsonAsync(path.join(dir, f))) as TaskPlan | null;
                 if (plan) plans.push(plan);
               }
               if (p.status) {
@@ -6061,12 +6454,12 @@ const agentChatroomPlugin = {
      * Resolve the best Chatroom channel for RAG usage reports.
      * Priority: current task's channel → dm_<agentId> (worker) → general (orchestrator).
      */
-    function resolveReportChannel(): string {
+    async function resolveReportChannel(): Promise<string> {
       try {
         const regPath = path.join(chatroomRoot(cfg), "registry", `${cfg.agentId}.json`);
-        const info = readJson(regPath);
+        const info = await readJsonAsync(regPath);
         if (info?.current_task) {
-          const task = readTaskRecord(cfg, info.current_task);
+          const task = await readTaskRecordAsync(cfg, info.current_task);
           if (task?.channel_id) return task.channel_id;
         }
       } catch {
@@ -6097,7 +6490,7 @@ const agentChatroomPlugin = {
           const ragServiceUrl =
             process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
           const url = `${ragServiceUrl}/query`;
-          const reportChannel = resolveReportChannel();
+          const reportChannel = await resolveReportChannel();
 
           // ── [RAG][QUERY] report ──
           try {
@@ -6760,7 +7153,9 @@ const agentChatroomPlugin = {
             }
 
             const dirUri = toChatroomUri(targetDir, cfg);
-            if (!fs.existsSync(targetDir)) {
+            try {
+              await access(targetDir);
+            } catch {
               return {
                 content: [
                   {
@@ -6772,18 +7167,18 @@ const agentChatroomPlugin = {
               };
             }
 
-            const entries = fs.readdirSync(targetDir, { withFileTypes: true });
+            const entries = await readdir(targetDir, { withFileTypes: true });
             const files: { name: string; path: string; size: string; type: string }[] = [];
             const dirs: string[] = [];
 
             for (const entry of entries) {
               if (entry.isFile()) {
                 const fullPath = toForwardSlash(path.join(targetDir, entry.name));
-                const stat = fs.statSync(fullPath);
+                const s = await stat(fullPath);
                 files.push({
                   name: entry.name,
                   path: toChatroomUri(fullPath, cfg),
-                  size: formatFileSize(stat.size),
+                  size: formatFileSize(s.size),
                   type: path.extname(entry.name).toLowerCase() || "(no ext)",
                 });
               } else if (entry.isDirectory()) {
@@ -6829,7 +7224,7 @@ const agentChatroomPlugin = {
         parameters: Type.Object({}),
         async execute(_toolCallId, _params) {
           try {
-            const channels = listAgentChannels(cfg);
+            const channels = await listAgentChannelsAsync(cfg);
             const text = JSON.stringify(
               channels.map((ch: any) => ({
                 id: ch.channel_id,
@@ -6863,8 +7258,8 @@ const agentChatroomPlugin = {
         parameters: Type.Object({}),
         async execute(_toolCallId, _params) {
           try {
-            const msgs = pollInbox(cfg);
-            updateHeartbeat(cfg);
+            const msgs = await pollInboxAsync(cfg);
+            await updateHeartbeatAsync(cfg);
             if (msgs.length === 0)
               return {
                 content: [{ type: "text" as const, text: "No new messages." }],
@@ -6927,7 +7322,9 @@ const agentChatroomPlugin = {
               phase: p.phase,
               detail: p.detail,
             });
-            updateTaskRecord(cfg, p.task_id, { current_phase: p.phase } as Partial<TaskRecord>);
+            await updateTaskRecordAsync(cfg, p.task_id, {
+              current_phase: p.phase,
+            } as Partial<TaskRecord>);
             return {
               content: [
                 {
@@ -6994,7 +7391,7 @@ const agentChatroomPlugin = {
                 details: undefined,
               };
             }
-            const task = readTaskRecord(cfg, p.task_id);
+            const task = await readTaskRecordAsync(cfg, p.task_id);
             if (!task) {
               return {
                 content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
@@ -7036,7 +7433,7 @@ const agentChatroomPlugin = {
                 extension: i.extension.startsWith(".") ? i.extension : `.${i.extension}`,
               })),
             };
-            updateTaskRecord(cfg, p.task_id, {
+            await updateTaskRecordAsync(cfg, p.task_id, {
               agreed_deliverables: agreed,
             } as Partial<TaskRecord>);
             const summary =
@@ -7161,7 +7558,7 @@ const agentChatroomPlugin = {
               max_wait_minutes?: number;
             };
 
-            const task = readTaskRecord(cfg, p.task_id);
+            const task = await readTaskRecordAsync(cfg, p.task_id);
             if (!task) {
               return {
                 content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
@@ -7205,10 +7602,10 @@ const agentChatroomPlugin = {
               poll_count: 0,
             };
 
-            writeParkedTask(cfg, parkedInfo);
+            await writeParkedTaskAsync(cfg, parkedInfo);
 
             const parkedAt = nowISO();
-            updateTaskRecord(cfg, p.task_id, {
+            await updateTaskRecordAsync(cfg, p.task_id, {
               status: "PARKED",
               current_phase: `parked_${watchType}`,
               parked_at: parkedAt,
@@ -7316,7 +7713,7 @@ const agentChatroomPlugin = {
               resume_prompt: string;
             };
 
-            const task = readTaskRecord(cfg, p.task_id);
+            const task = await readTaskRecordAsync(cfg, p.task_id);
             if (!task) {
               return {
                 content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
@@ -7374,9 +7771,9 @@ const agentChatroomPlugin = {
               last_poll_at: null,
               poll_count: 0,
             };
-            writeParkedTask(cfg, parkedInfo);
+            await writeParkedTaskAsync(cfg, parkedInfo);
 
-            updateTaskRecord(cfg, p.task_id, {
+            await updateTaskRecordAsync(cfg, p.task_id, {
               status: "PARKED",
               current_phase: "awaiting_permission",
             } as Partial<TaskRecord>);
@@ -7455,8 +7852,7 @@ const agentChatroomPlugin = {
                 timeout_minutes?: number;
               }[];
             };
-            // Plan approval mode must match actual behavior: only /human (task.human_approval_required) triggers human approval
-            const taskForPlan = readTaskRecord(cfg, p.task_id);
+            const taskForPlan = await readTaskRecordAsync(cfg, p.task_id);
             const approvalMode =
               (taskForPlan as any)?.human_approval_required === true ? "human" : "orchestrator";
             const plan = createNewPlan(
@@ -7473,14 +7869,13 @@ const agentChatroomPlugin = {
               })),
               approvalMode,
             );
-            updateTaskRecord(cfg, p.task_id, {
+            await updateTaskRecordAsync(cfg, p.task_id, {
               plan_id: plan.plan_id,
               total_steps: plan.steps.length,
               current_phase: "plan_created",
             } as Partial<TaskRecord>);
 
-            // Send plan to DM channel so it's visible in chat
-            const taskRecord = readTaskRecord(cfg, p.task_id);
+            const taskRecord = await readTaskRecordAsync(cfg, p.task_id);
             if (taskRecord) {
               const stepsText = plan.steps
                 .map(
@@ -7580,7 +7975,7 @@ const agentChatroomPlugin = {
               output_files?: string[];
               is_final_deliverable?: boolean;
             };
-            const plan = updatePlanStep(cfg, p.task_id, p.step_id, {
+            const plan = await updatePlanStepAsync(cfg, p.task_id, p.step_id, {
               status: "COMPLETED",
               result_summary: p.result_summary,
               output_files: p.output_files ?? [],
@@ -7594,7 +7989,7 @@ const agentChatroomPlugin = {
               };
             }
             const completed = plan.steps.filter((s) => s.status === "COMPLETED").length;
-            updateTaskRecord(cfg, p.task_id, {
+            await updateTaskRecordAsync(cfg, p.task_id, {
               current_step: completed,
               current_phase: `step_${completed}/${plan.steps.length}`,
             } as Partial<TaskRecord>);
@@ -7642,7 +8037,7 @@ const agentChatroomPlugin = {
         async execute(_toolCallId, params) {
           try {
             const p = params as { task_id: string; step_id: string; error_detail: string };
-            const plan = updatePlanStep(cfg, p.task_id, p.step_id, {
+            const plan = await updatePlanStepAsync(cfg, p.task_id, p.step_id, {
               status: "FAILED",
               error_detail: p.error_detail,
               completed_at: nowISO(),
@@ -7699,21 +8094,22 @@ const agentChatroomPlugin = {
         startNasHealthMonitor(cfg, logger);
         onNasStateChange((state, prev) => {
           if (state === "OFFLINE" && prev !== "OFFLINE") {
-            // Mark active tasks as NAS-offline buffering
-            try {
-              const activeTasks = listTasksByStatus(cfg, "PROCESSING", "ACKED");
-              for (const t of activeTasks) {
-                if (t.to === cfg.agentId || t.from === cfg.agentId) {
-                  updateTaskRecord(cfg, t.task_id, { current_phase: "nas_offline_buffering" });
-                  appendTaskProgress(cfg, t.task_id, {
-                    phase: "nas_offline_buffering",
-                    detail: `NAS went offline. Strategy: ${t.resume_strategy ?? "restart"}`,
-                  });
+            void (async () => {
+              try {
+                const activeTasks = await listTasksByStatusAsync(cfg, "PROCESSING", "ACKED");
+                for (const t of activeTasks) {
+                  if (t.to === cfg.agentId || t.from === cfg.agentId) {
+                    updateTaskRecord(cfg, t.task_id, { current_phase: "nas_offline_buffering" });
+                    appendTaskProgress(cfg, t.task_id, {
+                      phase: "nas_offline_buffering",
+                      detail: `NAS went offline. Strategy: ${t.resume_strategy ?? "restart"}`,
+                    });
+                  }
                 }
+              } catch {
+                /* updateTaskRecord already buffers locally */
               }
-            } catch {
-              /* updateTaskRecord already buffers locally */
-            }
+            })();
           }
 
           if (state === "ONLINE" && prev !== "ONLINE") {
@@ -7724,7 +8120,6 @@ const agentChatroomPlugin = {
               logger.error(`[sync] WAL sync failed: ${err}`);
             }
 
-            // Apply resume strategies for tasks that were buffering
             try {
               applyResumeStrategies(cfg, logger);
             } catch (err) {
@@ -7763,11 +8158,9 @@ const agentChatroomPlugin = {
         }
 
         heartbeatTimer = setInterval(() => {
-          try {
-            updateHeartbeat(cfg);
-          } catch {
+          void updateHeartbeatAsync(cfg).catch(() => {
             /* ignore */
-          }
+          });
         }, 30_000);
 
         logger.info(
@@ -7785,16 +8178,15 @@ const agentChatroomPlugin = {
 
           // Periodic health log every ~60s (at default 3s interval → every 20 cycles)
           if (pollCycleCount % 20 === 1) {
-            const inboxExists = fs.existsSync(inboxDirForLog);
+            let inboxExists = false;
             let pendingFiles = 0;
-            if (inboxExists) {
-              try {
-                pendingFiles = fs
-                  .readdirSync(inboxDirForLog)
-                  .filter((f) => f.endsWith(".json")).length;
-              } catch {
-                /* ignore */
-              }
+            try {
+              await access(inboxDirForLog);
+              inboxExists = true;
+              const allFiles = await readdir(inboxDirForLog);
+              pendingFiles = allFiles.filter((f) => f.endsWith(".json")).length;
+            } catch {
+              /* ignore */
             }
             logger.info(
               `[poll] Health: cycle=${pollCycleCount}, processed=${totalMsgProcessed}, ` +
@@ -7804,7 +8196,7 @@ const agentChatroomPlugin = {
           }
 
           try {
-            const messages = pollInbox(cfg, logger);
+            const messages = await pollInboxAsync(cfg, logger);
             for (const msg of messages) {
               totalMsgProcessed++;
               try {
@@ -7865,7 +8257,7 @@ const agentChatroomPlugin = {
                     }
                     break;
                   case "TASK_ACK":
-                    handleTaskAck(cfg, msg, logger);
+                    await handleTaskAck(cfg, msg, logger);
                     break;
                   case "DISPATCH_CONFIRMED":
                     logger.info(
@@ -7873,7 +8265,7 @@ const agentChatroomPlugin = {
                     );
                     break;
                   case "RESULT_REPORT":
-                    handleTaskResult(cfg, msg, logger);
+                    await handleTaskResult(cfg, msg, logger);
                     if (cfg.role === "orchestrator") {
                       const screening = sensitivityPreFilter(msg.content.text);
                       if (screening) {
