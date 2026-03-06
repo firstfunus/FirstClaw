@@ -483,16 +483,6 @@ function createNewPlan(
   return plan;
 }
 
-function readGlobalSettings(cfg: ChatroomConfig): Record<string, any> {
-  const settingsPath = path.join(configDir(cfg), "settings.json");
-  return readJson(settingsPath) ?? { allow_orchestrator_decisions: true };
-}
-
-function getApprovalMode(cfg: ChatroomConfig): "orchestrator" | "human" {
-  const settings = readGlobalSettings(cfg);
-  return settings.allow_orchestrator_decisions ? "orchestrator" : "human";
-}
-
 function assetsDir(cfg: ChatroomConfig, agentId?: string): string {
   const base = path.join(chatroomRoot(cfg), "assets");
   return agentId ? path.join(base, agentId) : base;
