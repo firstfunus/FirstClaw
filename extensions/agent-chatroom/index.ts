@@ -1552,6 +1552,36 @@ function sendMessageToNAS(
       );
     }
 
+    // Fire-and-forget: notify chatroom server so WebSocket clients see the
+    // message immediately instead of waiting for NASWatcher polling.
+    if (cfg.chatroomServerUrl) {
+      const notifyUrl = `${cfg.chatroomServerUrl.replace(/\/+$/, "")}/api/internal/notify-message`;
+      try {
+        const http = require("http");
+        const https = require("https");
+        const parsed = new URL(notifyUrl);
+        const transport = parsed.protocol === "https:" ? https : http;
+        const payload = JSON.stringify({ channel_id: channelId, seq });
+        const req = transport.request(
+          notifyUrl,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Length": Buffer.byteLength(payload),
+            },
+            timeout: 3000,
+          },
+          () => {},
+        );
+        req.on("error", () => {});
+        req.write(payload);
+        req.end();
+      } catch {
+        // Best-effort; NASWatcher is the fallback
+      }
+    }
+
     return { message_id: messageId, seq };
   } finally {
     releaseLock(lockPath);
@@ -4406,6 +4436,29 @@ async function buildOrchestratorContext(
     }
   } catch {
     /* ignore errors reading plans dir */
+  }
+
+  // Inject user-defined orchestrator rules from NAS config
+  try {
+    const rulesFile = path.join(cfg.nasRoot, "chatroom", "config", "orchestrator_rules.json");
+    if (fs.existsSync(rulesFile)) {
+      const allRules = JSON.parse(fs.readFileSync(rulesFile, "utf-8")) as Array<{
+        title: string;
+        content: string;
+        enabled: boolean;
+      }>;
+      const enabled = allRules.filter((r) => r.enabled);
+      if (enabled.length > 0) {
+        lines.push(`═══ ORCHESTRATOR RULES (User-defined) ═══`);
+        for (const rule of enabled) {
+          lines.push(`  [${rule.title}]`);
+          lines.push(`  ${rule.content}`);
+          lines.push(``);
+        }
+      }
+    }
+  } catch {
+    /* ignore errors reading orchestrator rules */
   }
 
   return lines.join("\n");
