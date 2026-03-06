@@ -221,6 +221,8 @@ interface StepResult {
   result_summary: string;
   output_files: string[];
   error_detail?: string;
+  /** True when the step called chatroom_task_park — session ended normally, not a failure. */
+  parked?: boolean;
 }
 
 const PLANNING_TIMEOUT_MS = 3 * 60_000;
@@ -2976,8 +2978,170 @@ async function monitorParkedTasks(
       updateTaskRecord(cfg, info.task_id, {
         status: "PROCESSING",
         current_phase: "resuming_from_park",
+        parked_at: null,
       } as Partial<TaskRecord>);
 
+      // Check if this task has a plan — if so, resume the parked step within the plan
+      // and then continue executing remaining steps via stepExecutionLoop.
+      const plan = readPlan(cfg, info.task_id);
+      const parkedStep = plan?.steps.find(
+        (s) => s.status === "IN_PROGRESS" && plan.status === "EXECUTING",
+      );
+
+      if (plan && parkedStep) {
+        logger.info(
+          `Resuming plan task ${info.task_id} from step ${parkedStep.order}/${plan.steps.length}`,
+        );
+        appendTaskProgress(cfg, info.task_id, {
+          phase: `step_${parkedStep.order}_resume`,
+          detail: `Park condition met, resuming step: ${result.slice(0, 100)}`,
+        });
+
+        const syntheticMsg: InboxMessage = {
+          message_id: `resume_${info.task_id}_${randomUUID()}`,
+          timestamp: nowISO(),
+          channel_id: info.channel_id,
+          from: "system",
+          content: { text: info.original_instruction, mentions: [info.agent_id] },
+          type: "TASK_DISPATCH",
+          metadata: {
+            task_id: info.task_id,
+            output_dir: toChatroomUri(taskAssetsDir(cfg, info.agent_id, info.task_id), cfg),
+          },
+          seq: 0,
+        };
+
+        // Execute the parked step with the resume prompt + park result as a step execution
+        const isPermissionResume = info.watch_type === "permission";
+        const parkResultContext = isPermissionResume
+          ? `Your previously requested sensitive operation has been APPROVED by the admin.\n${result}`
+          : `The long-running operation has completed. Here is the result:\n${result}`;
+
+        // Build previous results from completed steps before the parked one
+        const previousResults: { title: string; result: string }[] = [];
+        for (const s of plan.steps) {
+          if (s.order >= parkedStep.order) break;
+          if (s.status === "COMPLETED" && s.result_summary) {
+            previousResults.push({ title: s.title, result: s.result_summary });
+          }
+        }
+
+        // Inject park result into the step description so executeStep picks it up
+        const augmentedStep: PlanStep = {
+          ...parkedStep,
+          description: [
+            parkedStep.description,
+            ``,
+            `[RESUMED FROM PARK]`,
+            parkResultContext,
+            ``,
+            `Resume instructions:`,
+            info.resume_prompt,
+          ].join("\n"),
+        };
+
+        const outputDir = taskAssetsDir(cfg, info.agent_id, info.task_id);
+        ensureDir(outputDir);
+
+        // Run the parked step, then continue with remaining steps
+        void (async () => {
+          try {
+            const stepResult = await executeStep(
+              cfg,
+              plan,
+              augmentedStep,
+              info.task_id,
+              outputDir,
+              previousResults,
+              syntheticMsg,
+              runtime,
+              config,
+              logger,
+            );
+
+            if (stepResult.parked) {
+              // Step parked again — just let the park monitor handle it next time
+              logger.info(`Task ${info.task_id} re-parked during step ${parkedStep.order}`);
+              return;
+            }
+
+            if (!stepResult.success) {
+              const errDetail = stepResult.error_detail ?? "Unknown error";
+              logger.warn(`Resumed step ${parkedStep.order} failed: ${errDetail}`);
+              updatePlanStep(cfg, info.task_id, parkedStep.step_id, {
+                status: "FAILED",
+                error_detail: errDetail,
+                completed_at: nowISO(),
+              });
+              const latestPlan = readPlan(cfg, info.task_id);
+              if (latestPlan) {
+                for (const s of latestPlan.steps) {
+                  if (s.status === "PENDING") {
+                    updatePlanStep(cfg, info.task_id, s.step_id, { status: "SKIPPED" });
+                  }
+                }
+              }
+              updatePlan(cfg, info.task_id, { status: "FAILED", completed_at: nowISO() });
+              sendTaskResult(
+                cfg,
+                info.task_id,
+                `Plan failed at step ${parkedStep.order} (${parkedStep.title}): ${errDetail}`,
+                "FAILED",
+                logger,
+              );
+              return;
+            }
+
+            // Parked step completed — continue with remaining steps
+            const nextStepOrder = parkedStep.order + 1;
+            if (nextStepOrder > plan.steps.length) {
+              // This was the last step — plan is done
+              updatePlan(cfg, info.task_id, { status: "COMPLETED", completed_at: nowISO() });
+              previousResults.push({
+                title: parkedStep.title,
+                result: stepResult.result_summary,
+              });
+              const allResults = previousResults
+                .map((r, i) => `Step ${i + 1} (${r.title}): ${r.result}`)
+                .join("\n");
+              sendTaskResult(
+                cfg,
+                info.task_id,
+                `Plan completed: ${plan.summary}\n\n${allResults}`,
+                "DONE",
+                logger,
+                scanOutputDir(outputDir),
+              );
+              return;
+            }
+
+            // More steps remain — re-read the plan (step statuses may have changed) and continue
+            const freshPlan = readPlan(cfg, info.task_id);
+            if (!freshPlan) {
+              logger.error(`Plan disappeared for task ${info.task_id} after step resume`);
+              return;
+            }
+            logger.info(`Continuing plan for task ${info.task_id} from step ${nextStepOrder}`);
+            await stepExecutionLoop(
+              cfg,
+              freshPlan,
+              syntheticMsg,
+              info.task_id,
+              runtime,
+              config,
+              logger,
+              nextStepOrder,
+            );
+          } catch (err) {
+            logger.error(`Error resuming plan task ${info.task_id}: ${err}`);
+            sendTaskResult(cfg, info.task_id, `Plan resume failed: ${err}`, "FAILED", logger);
+          }
+        })();
+
+        continue;
+      }
+
+      // No plan or no parked step found — fall back to legacy single-session resume
       const isPermissionResume = info.watch_type === "permission";
       const resumeInstruction = isPermissionResume
         ? [
@@ -4542,11 +4706,13 @@ async function stepExecutionLoop(
   runtime: any,
   config: any,
   logger: Logger,
+  /** When resuming from park, skip steps before this order and seed previousResults from their result_summary. */
+  resumeFromStepOrder?: number,
 ): Promise<void> {
   updatePlan(chatroomCfg, taskId, { status: "EXECUTING" });
   updateTaskRecord(chatroomCfg, taskId, {
     current_phase: "executing_plan",
-    current_step: 0,
+    current_step: resumeFromStepOrder ?? 0,
   } as Partial<TaskRecord>);
 
   const rawOutputDir = msg.metadata?.output_dir as string | undefined;
@@ -4557,7 +4723,19 @@ async function stepExecutionLoop(
 
   const previousResults: { title: string; result: string }[] = [];
 
+  // When resuming after park, seed previousResults from already-completed steps
+  if (resumeFromStepOrder != null && resumeFromStepOrder > 1) {
+    for (const s of plan.steps) {
+      if (s.order >= resumeFromStepOrder) break;
+      if (s.status === "COMPLETED" && s.result_summary) {
+        previousResults.push({ title: s.title, result: s.result_summary });
+      }
+    }
+  }
+
   for (const step of plan.steps) {
+    // Skip already-completed steps when resuming from park
+    if (resumeFromStepOrder != null && step.order < resumeFromStepOrder) continue;
     // ── Abort checkpoint ──
     const task = readTaskRecord(chatroomCfg, taskId);
     if (task?.status === "CANCELLED") {
@@ -4657,7 +4835,16 @@ async function stepExecutionLoop(
       },
     } as Partial<TaskRecord>);
 
-    if (result.success) {
+    if (result.parked) {
+      // Step called chatroom_task_park — suspend the loop without marking failure.
+      // The park monitor will resume the task when the watched condition is met.
+      logger.info(`Task ${taskId} parked during step ${step.order} — suspending execution loop`);
+      appendTaskProgress(chatroomCfg, taskId, {
+        phase: `step_${step.order}_parked`,
+        detail: `Step parked, will resume when condition is met`,
+      });
+      return;
+    } else if (result.success) {
       previousResults.push({ title: step.title, result: result.result_summary });
     } else {
       // Step failed — record in progress log for frontend, then mark plan failed and send result
@@ -4874,6 +5061,23 @@ async function executeStep(
 
       if (kind === "final") {
         lastFinalPayloadText = text;
+
+        // Check if the task was parked during this step (e.g. chatroom_task_park was called).
+        // Park ends the LLM session normally — this is NOT a failure.
+        const taskAfterRun = readTaskRecord(chatroomCfg, taskId);
+        if (taskAfterRun?.status === "PARKED") {
+          updatePlanStep(chatroomCfg, taskId, step.step_id, {
+            status: "IN_PROGRESS",
+          } as any);
+          stepResult = {
+            success: false,
+            result_summary: "Step parked — waiting for external condition",
+            output_files: [],
+            parked: true,
+          };
+          return;
+        }
+
         // Check if the step was completed via tool call
         const updatedPlan = readPlan(chatroomCfg, taskId);
         const updatedStep = updatedPlan?.steps.find((s) => s.step_id === step.step_id);
