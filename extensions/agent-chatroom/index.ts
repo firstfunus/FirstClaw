@@ -298,10 +298,24 @@ interface Logger {
 // ============================================================================
 
 function readJson(filePath: string): any {
+  let fd: number | undefined;
   try {
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    fd = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(fd);
+    if (stat.size === 0) return null;
+    const buf = Buffer.alloc(stat.size);
+    fs.readSync(fd, buf, 0, stat.size, 0);
+    return JSON.parse(buf.toString("utf-8"));
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* NAS fd may already be invalid */
+      }
+    }
   }
 }
 
@@ -315,7 +329,20 @@ async function readJsonAsync(filePath: string): Promise<any> {
 }
 
 function writeJson(filePath: string, data: any): void {
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
+  const content = JSON.stringify(data, null, 2);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, "w");
+    fs.writeSync(fd, content, 0, "utf-8");
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* NAS fd may already be invalid */
+      }
+    }
+  }
 }
 
 async function writeJsonAsync(filePath: string, data: any): Promise<void> {
@@ -2034,6 +2061,18 @@ function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
         const taskPath = path.join(tasksDir(cfg), `${notif.retry_for_task}.json`);
         const taskData = readJson(taskPath);
         if (taskData) {
+          const _terminal = new Set(["DONE", "FAILED", "ABANDONED", "CANCELLED"]);
+          if (_terminal.has(taskData.status)) {
+            logger?.info?.(
+              `[pollInbox] Retry for task ${notif.retry_for_task} skipped — status is ${taskData.status}`,
+            );
+            try {
+              fs.unlinkSync(filePath);
+            } catch {
+              /* best-effort */
+            }
+            continue;
+          }
           messages.push({
             message_id: notif.notification_id ?? randomUUID(),
             channel_id: notif.channel_id,
@@ -2158,6 +2197,18 @@ async function pollInboxAsync(cfg: ChatroomConfig, logger?: Logger): Promise<Inb
         const taskPath = path.join(tasksDir(cfg), `${notif.retry_for_task}.json`);
         const taskData = await readJsonAsync(taskPath);
         if (taskData) {
+          const _terminal = new Set(["DONE", "FAILED", "ABANDONED", "CANCELLED"]);
+          if (_terminal.has(taskData.status)) {
+            logger?.info?.(
+              `[pollInbox] Retry for task ${notif.retry_for_task} skipped — status is ${taskData.status}`,
+            );
+            try {
+              await unlink(filePath);
+            } catch {
+              /* best-effort */
+            }
+            continue;
+          }
           messages.push({
             message_id: notif.notification_id ?? randomUUID(),
             channel_id: notif.channel_id,
@@ -3323,6 +3374,18 @@ async function monitorParkedTasks(
     const parkedAt = new Date(info.parked_at).getTime();
     const elapsed = now - parkedAt;
 
+    // Check if the underlying task was cancelled/completed externally
+    const _terminal = new Set(["DONE", "FAILED", "ABANDONED", "CANCELLED"]);
+    const taskRecord = readTaskRecord(cfg, info.task_id);
+    if (!taskRecord || _terminal.has(taskRecord.status)) {
+      logger.info(
+        `Parked task ${info.task_id} is now ${taskRecord?.status ?? "missing"}, cleaning up`,
+      );
+      removeParkedTask(cfg, info.task_id);
+      resetAgentStatus(cfg, info.agent_id, logger);
+      continue;
+    }
+
     if (elapsed > info.max_wait_ms) {
       logger.warn(`Parked task ${info.task_id} exceeded max wait (${info.max_wait_ms}ms)`);
       removeParkedTask(cfg, info.task_id);
@@ -3333,6 +3396,7 @@ async function monitorParkedTasks(
         error_detail: `Parked task timed out after ${Math.round(elapsed / 60000)} minutes`,
         current_phase: "park_timeout",
       } as Partial<TaskRecord>);
+      resetAgentStatus(cfg, info.agent_id, logger);
       sendMessageToNAS(
         cfg,
         info.channel_id,
@@ -3706,6 +3770,15 @@ async function handleIncomingTaskAsync(
   }
 
   const currentTask = readTaskRecord(cfg, taskId)!;
+
+  // Guard: do not process tasks that are already in a terminal state
+  const _terminal = new Set(["DONE", "FAILED", "ABANDONED", "CANCELLED"]);
+  if (_terminal.has(currentTask.status)) {
+    logger.info(`Task ${taskId} is already ${currentTask.status}, skipping`);
+    resetAgentStatus(cfg, cfg.agentId, logger);
+    return;
+  }
+
   // Echo identity token in ACK for orchestrator verification
   sendSystemAck(cfg, currentTask, logger, identityToken, sessionNonce);
 
@@ -4075,33 +4148,44 @@ function handleQuestionAnswer(cfg: ChatroomConfig, msg: InboxMessage, logger: Lo
 const RATE_LIMIT_RETRY_DELAY_MS = 60_000;
 
 async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise<void> {
+  const _terminalStatuses = new Set(["DONE", "FAILED", "ABANDONED", "CANCELLED"]);
   const pending = await listTasksByStatusAsync(cfg, "DISPATCHED", "TIMEOUT", "RETRYING");
   const now = Date.now();
 
   for (const task of pending) {
     if (task.from !== cfg.agentId) continue;
 
+    // Re-read from disk to avoid acting on stale state (e.g. cancelled via dashboard)
+    const fresh = await readTaskRecordAsync(cfg, task.task_id);
+    if (!fresh || _terminalStatuses.has(fresh.status)) {
+      logger.info(`Task ${task.task_id} is now ${fresh?.status ?? "missing"}, skipping`);
+      continue;
+    }
+
     // RETRYING tasks wait for the backoff period, then re-dispatch
-    if (task.status === "RETRYING") {
-      const completedAt = new Date(task.completed_at ?? task.dispatched_at).getTime();
+    if (fresh.status === "RETRYING") {
+      const completedAt = new Date(fresh.completed_at ?? fresh.dispatched_at).getTime();
       if (now - completedAt < RATE_LIMIT_RETRY_DELAY_MS) continue;
 
-      if (task.retries >= task.max_retries) {
-        updateTaskRecord(cfg, task.task_id, { status: "ABANDONED", completed_at: nowISO() });
+      if (fresh.retries >= fresh.max_retries) {
+        updateTaskRecord(cfg, fresh.task_id, { status: "ABANDONED", completed_at: nowISO() });
+        await resetAgentStatusAsync(cfg, fresh.to, logger);
         sendMessageToNAS(
           cfg,
-          task.channel_id,
-          `[SYSTEM] Task ${task.task_id} abandoned — rate limit retries exhausted (${task.max_retries} attempts)`,
+          fresh.channel_id,
+          `[SYSTEM] Task ${fresh.task_id} abandoned — rate limit retries exhausted (${fresh.max_retries} attempts)`,
           "SYSTEM",
           [],
         );
-        logger.warn(`Task ${task.task_id} ABANDONED after ${task.max_retries} rate-limit retries`);
+        logger.warn(
+          `Task ${fresh.task_id} ABANDONED after ${fresh.max_retries} rate-limit retries`,
+        );
         continue;
       }
 
-      updateTaskRecord(cfg, task.task_id, {
+      updateTaskRecord(cfg, fresh.task_id, {
         status: "DISPATCHED",
-        retries: task.retries + 1,
+        retries: fresh.retries + 1,
         dispatched_at: nowISO(),
         error_type: null,
         error_detail: null,
@@ -4110,64 +4194,65 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
       } as Partial<TaskRecord>);
 
       const root = chatroomRoot(cfg);
-      const inboxDir = path.join(root, "inbox", task.to);
+      const inboxDir = path.join(root, "inbox", fresh.to);
       ensureDir(inboxDir);
       const notif = {
         notification_id: randomUUID(),
         timestamp: nowISO(),
-        channel_id: task.channel_id,
+        channel_id: fresh.channel_id,
         message_seq: 0,
         from: cfg.agentId,
-        preview: `[RATE-LIMIT RETRY ${task.retries + 1}/${task.max_retries}] ${task.instruction.slice(0, 80)}`,
+        preview: `[RATE-LIMIT RETRY ${fresh.retries + 1}/${fresh.max_retries}] ${fresh.instruction.slice(0, 80)}`,
         priority: "urgent",
-        retry_for_task: task.task_id,
+        retry_for_task: fresh.task_id,
       };
-      writeJson(path.join(inboxDir, `retry_${task.task_id}_${notif.notification_id}.json`), notif);
+      writeJson(path.join(inboxDir, `retry_${fresh.task_id}_${notif.notification_id}.json`), notif);
       logger.info(
-        `Task ${task.task_id} rate-limit retry ${task.retries + 1}/${task.max_retries} → ${task.to}`,
+        `Task ${fresh.task_id} rate-limit retry ${fresh.retries + 1}/${fresh.max_retries} → ${fresh.to}`,
       );
       continue;
     }
 
-    const dispatchedAt = new Date(task.dispatched_at).getTime();
+    const dispatchedAt = new Date(fresh.dispatched_at).getTime();
     const elapsed = now - dispatchedAt;
 
-    if (elapsed > task.ack_timeout_ms) {
-      if (task.retries >= task.max_retries) {
-        updateTaskRecord(cfg, task.task_id, { status: "ABANDONED" });
+    if (elapsed > fresh.ack_timeout_ms) {
+      if (fresh.retries >= fresh.max_retries) {
+        updateTaskRecord(cfg, fresh.task_id, { status: "ABANDONED" });
+        await resetAgentStatusAsync(cfg, fresh.to, logger);
         sendMessageToNAS(
           cfg,
-          task.channel_id,
-          `[SYSTEM] Task ${task.task_id} abandoned — ${task.to} did not respond after ${task.max_retries} retries`,
+          fresh.channel_id,
+          `[SYSTEM] Task ${fresh.task_id} abandoned — ${fresh.to} did not respond after ${fresh.max_retries} retries`,
           "SYSTEM",
           [],
         );
-        logger.warn(`Task ${task.task_id} ABANDONED (${task.to} unreachable)`);
+        logger.warn(`Task ${fresh.task_id} ABANDONED (${fresh.to} unreachable)`);
       } else {
-        updateTaskRecord(cfg, task.task_id, {
+        updateTaskRecord(cfg, fresh.task_id, {
           status: "TIMEOUT",
-          retries: task.retries + 1,
+          retries: fresh.retries + 1,
           dispatched_at: nowISO(),
         });
         const root = chatroomRoot(cfg);
-        const inboxDir = path.join(root, "inbox", task.to);
+        const inboxDir = path.join(root, "inbox", fresh.to);
         ensureDir(inboxDir);
         const notif = {
           notification_id: randomUUID(),
           timestamp: nowISO(),
-          channel_id: task.channel_id,
+          channel_id: fresh.channel_id,
           message_seq: 0,
           from: cfg.agentId,
-          preview: `[RETRY ${task.retries + 1}/${task.max_retries}] ${task.instruction.slice(0, 80)}`,
+          preview: `[RETRY ${fresh.retries + 1}/${fresh.max_retries}] ${fresh.instruction.slice(0, 80)}`,
           priority: "urgent",
-          retry_for_task: task.task_id,
+          retry_for_task: fresh.task_id,
         };
         writeJson(
-          path.join(inboxDir, `retry_${task.task_id}_${notif.notification_id}.json`),
+          path.join(inboxDir, `retry_${fresh.task_id}_${notif.notification_id}.json`),
           notif,
         );
         logger.warn(
-          `Task ${task.task_id} ACK timeout — retry ${task.retries + 1}/${task.max_retries} sent to ${task.to}`,
+          `Task ${fresh.task_id} ACK timeout — retry ${fresh.retries + 1}/${fresh.max_retries} sent to ${fresh.to}`,
         );
       }
     }
@@ -4186,6 +4271,7 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
         error_detail: `Task timed out after ${Math.round(task.task_timeout_ms / 60000)} minutes`,
         current_phase: "timed_out",
       } as Partial<TaskRecord>);
+      await resetAgentStatusAsync(cfg, task.to, logger);
       sendMessageToNAS(
         cfg,
         task.channel_id,
