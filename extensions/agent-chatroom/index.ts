@@ -5027,7 +5027,18 @@ async function autoDispatchMessage(
         if (!text.trim()) return;
         try {
           const inlineMentions = parseAtMentions(text);
-          const result = sendMessageToNAS(chatroomCfg, channelId, text, "CHAT", inlineMentions);
+          const replyMeta: Record<string, unknown> = {
+            triggered_by: msg.type,
+          };
+          const result = sendMessageToNAS(
+            chatroomCfg,
+            channelId,
+            text,
+            "CHAT",
+            inlineMentions,
+            undefined,
+            replyMeta,
+          );
           logger.info(`Auto-reply → #${channelId} (seq: ${result.seq})`);
         } catch (err) {
           logger.error(`Failed to send auto-reply to ${channelId}: ${err}`);
@@ -8755,9 +8766,34 @@ const agentChatroomPlugin = {
                   case "PLAN_REJECTED":
                   case "SYSTEM":
                     break;
-                  default:
+                  default: {
+                    // Guard against agent↔agent feedback loops in DM channels.
+                    //
+                    // In DM channels, agent messages arrive as CHAT via the auto-reply
+                    // deliver callback. Each auto-reply carries metadata.triggered_by
+                    // indicating what originally caused the LLM to respond.
+                    //
+                    // When triggered_by is "CHAT", the reply is a conversational ack
+                    // (e.g. "Acknowledged…") that must NOT cause the peer to respond —
+                    // otherwise A replies to B's ack, B replies to A's ack, ad infinitum.
+                    //
+                    // When triggered_by is a task-related type (RESULT_REPORT,
+                    // QUESTION_FORWARD, etc.) the reply carries substantive instructions
+                    // (e.g. "please revise X") that the peer MUST act on.
+                    const isFromHuman = msg.from.startsWith("human:");
+                    const isInDM = msg.channel_id.startsWith("dm_");
+                    if (isInDM && !isFromHuman) {
+                      const triggeredBy = (msg.metadata as any)?.triggered_by as string | undefined;
+                      if (!triggeredBy || triggeredBy === "CHAT") {
+                        logger.info(
+                          `[loop-guard] Skipping LLM dispatch for ack-like message from ${msg.from} in ${msg.channel_id} (triggered_by=${triggeredBy ?? "unknown"}) — prevents feedback loop`,
+                        );
+                        break;
+                      }
+                    }
                     await autoDispatchMessage(cfg, msg, runtime, config, logger);
                     break;
+                  }
                 }
               } catch (err) {
                 logger.error(`Message handling failed for ${msg.message_id}: ${err}`);
