@@ -41,7 +41,7 @@
     "ragServiceUrl": {
       "label": "RAG Service URL",
       "placeholder": "http://192.168.1.100:8000",
-      "help": "URL of the rag_graphrag service. Overridden by RAG_SERVICE_URL env var. Defaults to http://localhost:8000."
+      "help": "URL of the rag_graphrag service. Overridden by RAG_SERVICE_URL env var. Defaults to http://localhost:8000. The RAG API requires a domain parameter; agents are currently restricted to the 'gdd' domain only."
     },
     "workerTaskQueueMaxSize": {
       "label": "Worker Task Queue Max Size",

@@ -4633,7 +4633,8 @@ async function buildOrchestratorContext(
   }
   lines.push(``);
   lines.push(`═══ RAG (Project Knowledge) — MANDATORY ═══`);
-  lines.push(`  Use rag_query(query="...") to retrieve project context from the RAG system.`);
+  lines.push(`  Use rag_query(query="...", domain="gdd") to retrieve project context from the RAG system.`);
+  lines.push(`  Agent RAG access is currently restricted to the GDD domain only (domain="gdd").`);
   lines.push(`  CRITICAL RULES:`);
   lines.push(
     `    1. You MUST call rag_query for ANY question about the project, game, design, specs, or team decisions.`,
@@ -4797,8 +4798,9 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  Use your tools (shell, read workspace, etc.) and TOOLS.md first; only say you cannot when both RAG and TOOLS don't cover it.`,
     ``,
     `═══ RAG (Project Knowledge) — USE FOR FACTS ═══`,
+    `  Agent RAG access is currently restricted to the GDD domain only (domain="gdd").`,
     `  BEFORE starting any task, query RAG for relevant project context:`,
-    `    rag_query(query="relevant question about the project")`,
+    `    rag_query(query="relevant question about the project", domain="gdd")`,
     `  Use RAG for project facts. If RAG is unavailable, state that and proceed using TOOLS.md and your tools.`,
     `  Do NOT refuse to execute a task solely because RAG lacked some detail — your capabilities are in TOOLS.md.`,
     ``,
@@ -5154,9 +5156,10 @@ async function fetchPlanningContext(
       process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
     const query = msg.content.text.trim().slice(0, 500) || "Project context and conventions";
 
-    // ── 1. Query RAG ───────────────────────────────────────────────────────
+    // ── 1. Query RAG (domain locked to gdd for agents) ─────────────────────
+    const ragDomain = "gdd";
     try {
-      sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] ${query}`, "STATUS_UPDATE");
+      sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] domain=${ragDomain} | ${query}`, "STATUS_UPDATE");
     } catch (e) {
       logger.warn(`RAG report (QUERY) failed: ${e}`);
     }
@@ -5164,7 +5167,7 @@ async function fetchPlanningContext(
       const response = await fetch(`${ragServiceUrl}/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, top_k: 5 }),
+        body: JSON.stringify({ query, domain: ragDomain, top_k: 5 }),
       });
       if (!response.ok) {
         ragText = `RAG query failed (${response.status}). Proceed with your best judgment; do not fabricate project details.`;
@@ -6967,18 +6970,43 @@ const agentChatroomPlugin = {
         description:
           "Query the project RAG (Retrieval Augmented Generation) system to retrieve relevant project context.\n" +
           "IMPORTANT: You SHOULD call this tool before starting any task to understand the project context.\n" +
-          "The RAG contains project documentation, design specs, codebase knowledge, and prior decisions.",
+          "The RAG contains project documentation, design specs, codebase knowledge, and prior decisions.\n" +
+          "Agent RAG access is currently restricted to the GDD domain only.",
         parameters: Type.Object({
           query: Type.String({
             description:
               "Natural language query about the project (e.g. 'What is the art style guide?')",
           }),
+          domain: Type.Optional(
+            Type.String({
+              description:
+                "RAG domain to query. Currently only 'gdd' is allowed for agents. Defaults to 'gdd'.",
+            }),
+          ),
           max_results: Type.Optional(
             Type.Number({ description: "Maximum number of results to return (default 5)" }),
           ),
         }),
         async execute(_toolCallId, params) {
-          const p = params as { query: string; max_results?: number };
+          const p = params as { query: string; domain?: string; max_results?: number };
+
+          const ALLOWED_DOMAIN = "gdd";
+          const requestedDomain = p.domain ?? ALLOWED_DOMAIN;
+          if (requestedDomain !== ALLOWED_DOMAIN) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `RAG domain "${requestedDomain}" is not allowed. ` +
+                    `Agent RAG access is currently restricted to the "${ALLOWED_DOMAIN}" domain only. ` +
+                    `Use domain="gdd" or omit the domain parameter.`,
+                },
+              ],
+              details: undefined,
+            };
+          }
+
           const ragServiceUrl =
             process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
           const url = `${ragServiceUrl}/query`;
@@ -6986,7 +7014,7 @@ const agentChatroomPlugin = {
 
           // ── [RAG][QUERY] report ──
           try {
-            sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] ${p.query}`, "STATUS_UPDATE");
+            sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] domain=${ALLOWED_DOMAIN} | ${p.query}`, "STATUS_UPDATE");
           } catch (e) {
             logger.warn(`RAG report (QUERY) failed: ${e}`);
           }
@@ -6997,6 +7025,7 @@ const agentChatroomPlugin = {
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 query: p.query,
+                domain: ALLOWED_DOMAIN,
                 top_k: p.max_results ?? 5,
               }),
             });
